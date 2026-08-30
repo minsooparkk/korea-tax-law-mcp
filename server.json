@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.minsooparkk/korea-tax-law-mcp",
+  "description": "Korean tax law graph: current statutes, 150k+ court/tribunal cases, 145k+ NTS rulings.",
+  "repository": {
+    "url": "https://github.com/minsooparkk/korea-tax-law-mcp",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "websiteUrl": "https://github.com/minsooparkk/korea-tax-law-mcp",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.taxjarvis.com/mcp"
+    }
+  ]
+}
