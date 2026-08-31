@@ -39,7 +39,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -157,10 +157,22 @@ def t_list_laws(args: dict) -> str:
         "coalesce(l.ministry, '') AS ministry "
         "ORDER BY l.law_name"
     )
-    local = sum(1 for r in rows if "행정안전부" in r["ministry"])
-    lines = [f"수록 현행 법령 {len(rows)}건 (국세 {len(rows) - local} · 지방세 {local}):"]
+    # 조세특례제한법은 소관이 '재정경제부,행정안전부' 공동이라 지방세로 세면 안 된다.
+    def kind(m):
+        if "," in m:
+            return "공통"
+        return "지방세" if "행정안전부" in m else "국세"
+
+    counts = {"국세": 0, "지방세": 0, "공통": 0}
     for r in rows:
-        tag = " [지방세]" if "행정안전부" in r["ministry"] else ""
+        counts[kind(r["ministry"])] += 1
+    lines = [
+        f"수록 현행 법령 {len(rows)}건 "
+        f"(국세 {counts['국세']} · 지방세 {counts['지방세']} · 국세/지방세 공통 {counts['공통']}):"
+    ]
+    for r in rows:
+        k = kind(r["ministry"])
+        tag = "" if k == "국세" else f" [{k}]"
         lines.append(f"- {r['name']} ({r['type']}, 시행 {fmt_date(r['enf'])}){tag}")
     lines.append("\n※ 목록에 없는 법령은 이 DB에 미수록. 국가법령정보센터(law.go.kr) 확인 요망.")
     lines.append("※ 조세조약은 별도 수록 — list_treaties로 확인.")
