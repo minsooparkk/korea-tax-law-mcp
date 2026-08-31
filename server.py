@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """세법 그래프 MCP 서버 — 공개용 read-only Streamable HTTP (stateless).
 
-한국 세법 법령·판례·심판례·해석례 그래프 DB(Neo4j)를 MCP 도구로 노출한다.
+한국 세법 법령·판례·심판례·해석례·조세조약 그래프 DB(Neo4j)를 MCP 도구로 노출한다.
+- 수록 범위: 국세 + 지방세 현행 법령(법·령·칙), 판례·조세심판원 결정례,
+  국세청·법제처·행정안전부 해석례, 조세조약(체결국별 협약·의정서 조문)
 - 의존성 없음: 파이썬 표준 라이브러리만 사용 (3.9+)
 - Neo4j 접근: HTTP Query API v2 (읽기 전용 파라미터 쿼리만, raw cypher 노출 없음)
 - 방어: IP당 분당 호출 제한, 전역 동시 쿼리 제한, 쿼리 타임아웃
@@ -37,7 +39,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -47,10 +49,13 @@ NEO4J_TIMEOUT = 8          # 쿼리 타임아웃(초)
 MAX_BODY = 64 * 1024       # 요청 본문 한도
 
 INSTRUCTIONS = (
-    "한국 세법 법령 그래프 DB입니다. 현행 세법 조문(법률·시행령·시행규칙), 판례, "
-    "조세심판원 결정례, 국세청 해석례를 검색·조회할 수 있습니다. "
+    "한국 세법 법령 그래프 DB입니다. 국세·지방세 현행 조문(법률·시행령·시행규칙), 판례, "
+    "조세심판원 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
     "조문은 '현행 시행 버전' 기준이며 각 결과에 시행일이 표기됩니다. "
-    "수록 법령 목록은 list_laws로 확인하세요(미수록 법령은 국가법령정보센터 law.go.kr 참조). "
+    "수록 법령 목록은 list_laws로, 조세조약 체결국은 list_treaties로 확인하세요"
+    "(미수록 법령은 국가법령정보센터 law.go.kr 참조). "
+    "국내 조문과 조약이 충돌하면 조약이 우선하므로, 비거주자·외국법인 쟁점은 "
+    "국내법 조문과 해당국 조약 조문을 함께 확인하세요. "
     "제공 정보는 실무 참고용이며 공식 유권해석이 아닙니다."
 )
 
@@ -148,13 +153,17 @@ def clip(s, n=300) -> str:
 def t_list_laws(args: dict) -> str:
     rows = cypher(
         "MATCH (l:Law) WHERE l.is_current = true "
-        "RETURN l.law_name AS name, l.law_type AS type, l.enforcement_date AS enf "
+        "RETURN l.law_name AS name, l.law_type AS type, l.enforcement_date AS enf, "
+        "coalesce(l.ministry, '') AS ministry "
         "ORDER BY l.law_name"
     )
-    lines = [f"수록 현행 법령 {len(rows)}건:"]
+    local = sum(1 for r in rows if "행정안전부" in r["ministry"])
+    lines = [f"수록 현행 법령 {len(rows)}건 (국세 {len(rows) - local} · 지방세 {local}):"]
     for r in rows:
-        lines.append(f"- {r['name']} ({r['type']}, 시행 {fmt_date(r['enf'])})")
+        tag = " [지방세]" if "행정안전부" in r["ministry"] else ""
+        lines.append(f"- {r['name']} ({r['type']}, 시행 {fmt_date(r['enf'])}){tag}")
     lines.append("\n※ 목록에 없는 법령은 이 DB에 미수록. 국가법령정보센터(law.go.kr) 확인 요망.")
+    lines.append("※ 조세조약은 별도 수록 — list_treaties로 확인.")
     return "\n".join(lines)
 
 
@@ -320,6 +329,139 @@ def t_search_interpretations(args: dict) -> str:
     return "\n\n".join(out)
 
 
+# ---------------------------------------------------------------- 조세조약
+#
+# 데이터 특성: 한 국가의 조약 조문(TreatyArticle)은 그 국가의 Treaty 레코드 하나에만
+# 붙어 있고, 본문은 개정의정서가 반영된 통합본이다. 반면 그 레코드의 조약명·발효일은
+# 최초 협약 기준일 수 있어(예: 싱가포르 — 본문은 2019 개정본, 레코드 발효일은 1981)
+# 조문 옆에 발효일을 찍으면 틀린 정보가 된다. 그래서 조문 도구는 발효일을 붙이지 않고,
+# 국가별 협약·의정서 이력은 list_treaties로 따로 보여준다.
+
+
+def _treaty_records(country: str) -> list:
+    return cypher(
+        "MATCH (t:Treaty) WHERE t.country CONTAINS $c "
+        "OPTIONAL MATCH (t)-[:CONTAINS]->(a:TreatyArticle) "
+        "RETURN t.country AS c, t.treaty_name AS name, t.signed_date AS sd, "
+        "t.effective_date AS ed, t.treaty_url AS url, count(a) AS arts "
+        "ORDER BY ed DESC",
+        {"c": country},
+    )
+
+
+def t_list_treaties(args: dict) -> str:
+    country = str(args.get("country") or "").strip()
+    if not country:
+        rows = cypher(
+            "MATCH (t:Treaty) WHERE coalesce(t.country, '') <> '' "
+            "RETURN t.country AS c, count(t) AS n ORDER BY c"
+        )
+        total = sum(r["n"] for r in rows)
+        return (
+            f"조세조약 체결국 {len(rows)}개국 · 총 {total}건 (협약·개정의정서·교환각서 포함)\n\n"
+            + ", ".join(f"{r['c']}({r['n']})" for r in rows)
+            + "\n\n※ country를 지정하면 그 나라의 협약·의정서 이력을, "
+            "search_treaties는 조문 본문을 검색한다."
+        )
+    rows = _treaty_records(country)
+    if not rows:
+        return (
+            f"'{country}'와 체결된 조세조약이 DB에 없음. "
+            "country 없이 호출해 체결국 목록을 먼저 확인하세요."
+        )
+    out = [f"{country} 조세조약 {len(rows)}건 (발효일 최신순):"]
+    for r in rows:
+        tag = f" — 조문 {r['arts']}개 수록" if r["arts"] else " — 조문 미수록(원문 확인 요망)"
+        out.append(
+            f"- {r['name']}\n  서명 {fmt_date(r['sd']) or '-'} · 발효 {fmt_date(r['ed']) or '-'}{tag}"
+        )
+    if any(r["arts"] for r in rows):
+        out.append(
+            "\n※ 수록 조문 본문은 개정의정서가 반영된 통합본이나, 조문이 붙은 레코드의 "
+            "조약명·발효일은 최초 협약 기준일 수 있다. 발효 시점이 쟁점이면 위 이력과 "
+            "law.go.kr 원문을 함께 확인할 것."
+        )
+    out.append("※ 조문 원문은 get_treaty_article, 키워드 검색은 search_treaties.")
+    return "\n".join(out)
+
+
+def t_search_treaties(args: dict) -> str:
+    q = lucene_escape(str(args["query"]))
+    country = str(args.get("country") or "").strip() or None
+    limit = min(int(args.get("limit", 5)), 15)
+    rows = cypher(
+        "CALL db.index.fulltext.queryNodes('treaty_article_ft', $q) YIELD node, score "
+        "WHERE ($c IS NULL OR node.country CONTAINS $c) "
+        "RETURN node.country AS c, node.article_number AS no, node.article_title AS title, "
+        "substring(coalesce(node.content, node.content_en, ''), 0, 320) AS preview, score "
+        "ORDER BY score DESC LIMIT $limit",
+        {"q": q, "c": country, "limit": limit},
+    )
+    if not rows:
+        return (
+            "검색 결과 없음. 조약 용어(예: '사용료', '고정사업장', '배당', '이자')로 "
+            "다시 시도하거나 list_treaties로 체결 여부를 확인하세요."
+        )
+    out = []
+    for r in rows:
+        out.append(
+            f"[{r['c']} 조세조약 {r['no']}] {r['title'] or ''}\n  {clip(r['preview'], 320)}"
+        )
+    out.append(
+        "\n※ 조문 전문은 get_treaty_article(country, article_number)로 조회. "
+        "본문은 개정 반영 통합본 기준이며, 협약·의정서 발효 이력은 list_treaties(country)로 확인."
+    )
+    return "\n\n".join(out)
+
+
+def t_get_treaty_article(args: dict) -> str:
+    country = str(args["country"]).strip()
+    no = norm_article_no(args["article_number"])
+    rows = cypher(
+        "MATCH (t:Treaty)-[:CONTAINS]->(a:TreatyArticle) "
+        "WHERE a.country CONTAINS $c AND a.article_number = $no "
+        "RETURN a.country AS c, a.article_title AS title, a.content AS kr, "
+        "a.content_en AS en, t.treaty_url AS url "
+        "LIMIT 1",
+        {"c": country, "no": no},
+    )
+    if not rows:
+        near = cypher(
+            "MATCH (a:TreatyArticle) WHERE a.country CONTAINS $c "
+            "RETURN a.article_number AS n, a.article_title AS t ORDER BY a.seq LIMIT 30",
+            {"c": country},
+        )
+        if near:
+            listing = ", ".join(f"{r['n']} {r['t'] or ''}".strip() for r in near)
+            return f"'{country} {no}' 조문 없음. 수록 조문: {listing} …"
+        return (
+            f"'{country} {no}' 조약 조문을 찾지 못함. "
+            "list_treaties로 체결·수록 여부를 먼저 확인하세요."
+        )
+    r = rows[0]
+    out = [
+        f"# {r['c']} 조세조약 {no} {r['title'] or ''}",
+        "",
+        (r["kr"] or "").strip() or "(국문본 없음)",
+    ]
+    en = (r["en"] or "").strip()
+    if en:
+        out += ["", "## 영문본", en[:4000] + ("…" if len(en) > 4000 else "")]
+    recs = _treaty_records(r["c"])
+    if len(recs) > 1:
+        out.append("\n## 해당국 협약·의정서 이력")
+        for x in recs:
+            mark = " (조문 수록본)" if x["arts"] else ""
+            out.append(f"- 발효 {fmt_date(x['ed']) or '-'} · {x['name']}{mark}")
+    if r["url"]:
+        out.append(f"\n출처: {r['url']}")
+    out.append(
+        "※ 본문은 개정의정서가 반영된 통합본 기준. 발효 시점이 쟁점이면 위 이력과 "
+        "law.go.kr 원문을 확인할 것."
+    )
+    return "\n".join(out)
+
+
 TOOLS = [
     {
         "name": "list_laws",
@@ -397,6 +539,47 @@ TOOLS = [
             "additionalProperties": False,
         },
         "fn": t_search_interpretations,
+    },
+    {
+        "name": "list_treaties",
+        "description": "한국이 체결한 조세조약(이중과세방지협약) 수록 현황을 반환한다. country 없이 호출하면 체결국 목록, country를 주면 그 나라 조약(협약·개정의정서·교환각서) 목록과 발효일.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "country": {"type": "string", "description": "체결국 한글명 (예: '미국', '일본'). 생략하면 전체 체결국 목록"},
+            },
+            "additionalProperties": False,
+        },
+        "fn": t_list_treaties,
+    },
+    {
+        "name": "search_treaties",
+        "description": "조세조약(이중과세방지협약) 조문을 전문검색한다. 비거주자·외국법인의 원천징수 제한세율, 고정사업장, 사용료·배당·이자 과세권 확인에 사용. country로 특정국 한정 가능. 조문 본문은 개정 반영 통합본 기준.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "검색어 (예: '사용료', '고정사업장', '배당 제한세율')"},
+                "country": {"type": "string", "description": "체결국 한글명 필터 (부분 일치)"},
+                "limit": {"type": "integer", "description": "기본 5, 최대 15"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "fn": t_search_treaties,
+    },
+    {
+        "name": "get_treaty_article",
+        "description": "특정국 조세조약의 조문 원문 전체를 국문·영문으로 반환한다. 제한세율 등 정확한 수치는 반드시 이 도구로 원문을 확인할 것.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "country": {"type": "string", "description": "체결국 한글명 (예: '미국')"},
+                "article_number": {"type": "string", "description": "조번호 (예: '제12조', '12')"},
+            },
+            "required": ["country", "article_number"],
+            "additionalProperties": False,
+        },
+        "fn": t_get_treaty_article,
     },
 ]
 TOOL_MAP = {t["name"]: t for t in TOOLS}
