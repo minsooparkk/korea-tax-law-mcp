@@ -39,7 +39,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.3.2"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -343,21 +343,38 @@ def t_search_interpretations(args: dict) -> str:
 
 # ---------------------------------------------------------------- 조세조약
 #
-# 데이터 특성: 한 국가의 조약 조문(TreatyArticle)은 그 국가의 Treaty 레코드 하나에만
-# 붙어 있고, 본문은 개정의정서가 반영된 통합본이다. 반면 그 레코드의 조약명·발효일은
-# 최초 협약 기준일 수 있어(예: 싱가포르 — 본문은 2019 개정본, 레코드 발효일은 1981)
-# 조문 옆에 발효일을 찍으면 틀린 정보가 된다. 그래서 조문 도구는 발효일을 붙이지 않고,
-# 국가별 협약·의정서 이력은 list_treaties로 따로 보여준다.
+# 조문 본문은 국세법령정보시스템이 국가당 조약 1건 단위로 준다. 두 가지를 조심해야 한다.
+#  1) 개정의정서가 반영된 통합본이 아니다 — 스위스 제10조는 1980년 협약 원문(배당
+#     10/15%)이고 이후 의정서가 반영돼 있지 않다.
+#  2) 협약 전체를 대체한 신협정이 있으면 본문은 신협정인데 목록 발효일자는 옛 협약
+#     것이 온다 — 싱가포르는 본문이 2019년 협정, 발효일자는 1981년이다.
+# 그래서 조문에 발효일을 찍지 않는다. 대신 수집 파이프라인이 붙여 둔
+# later_record_count / country_latest_effective_date 로 "뒤에 개정이 더 있다"를 알린다.
 
 
 def _treaty_records(country: str) -> list:
     return cypher(
         "MATCH (t:Treaty) WHERE t.country CONTAINS $c "
-        "OPTIONAL MATCH (t)-[:CONTAINS]->(a:TreatyArticle) "
         "RETURN t.country AS c, t.treaty_name AS name, t.signed_date AS sd, "
-        "t.effective_date AS ed, t.treaty_url AS url, count(a) AS arts "
+        "t.effective_date AS ed, t.treaty_url AS url, "
+        "coalesce(t.body_article_count, 0) AS arts, "
+        "coalesce(t.later_record_count, 0) AS later, "
+        "coalesce(t.country_latest_effective_date, '') AS latest "
         "ORDER BY ed DESC",
         {"c": country},
+    )
+
+
+def _amendment_warning(recs: list) -> str:
+    """본문을 든 레코드보다 늦게 발효된 조약이 있으면 경고 문구를 만든다."""
+    holder = next((r for r in recs if r["arts"]), None)
+    if not holder or not holder["later"]:
+        return ""
+    return (
+        f"⚠ 이 국가에는 수록 본문보다 늦게 발효된 협약·의정서가 {holder['later']}건 있다"
+        f"(최신 발효 {fmt_date(holder['latest'])}). 국세법령정보시스템 본문은 개정의정서를"
+        " 반영하지 않은 경우가 있으니, 제한세율 등 수치는 협약·의정서 이력과"
+        " law.go.kr 원문으로 반드시 확인할 것."
     )
 
 
@@ -375,25 +392,23 @@ def t_list_treaties(args: dict) -> str:
             + "\n\n※ country를 지정하면 그 나라의 협약·의정서 이력을, "
             "search_treaties는 조문 본문을 검색한다."
         )
-    rows = _treaty_records(country)
-    if not rows:
+    recs = _treaty_records(country)
+    if not recs:
         return (
             f"'{country}'와 체결된 조세조약이 DB에 없음. "
             "country 없이 호출해 체결국 목록을 먼저 확인하세요."
         )
-    out = [f"{country} 조세조약 {len(rows)}건 (발효일 최신순):"]
-    for r in rows:
-        tag = f" — 조문 {r['arts']}개 수록" if r["arts"] else " — 조문 미수록(원문 확인 요망)"
+    out = [f"{country} 조세조약 {len(recs)}건 (발효일 최신순):"]
+    for r in recs:
+        tag = f" — 조문 {r['arts']}개 수록" if r["arts"] else " — 조문 미수록"
         out.append(
-            f"- {r['name']}\n  서명 {fmt_date(r['sd']) or '-'} · 발효 {fmt_date(r['ed']) or '-'}{tag}"
+            f"- {r['name']}\n  서명 {fmt_date(r['sd']) or '-'} · "
+            f"발효 {fmt_date(r['ed']) or '-'}{tag}"
         )
-    if any(r["arts"] for r in rows):
-        out.append(
-            "\n※ 수록 조문 본문은 개정의정서가 반영된 통합본이나, 조문이 붙은 레코드의 "
-            "조약명·발효일은 최초 협약 기준일 수 있다. 발효 시점이 쟁점이면 위 이력과 "
-            "law.go.kr 원문을 함께 확인할 것."
-        )
-    out.append("※ 조문 원문은 get_treaty_article, 키워드 검색은 search_treaties.")
+    warn = _amendment_warning(recs)
+    if warn:
+        out.append("\n" + warn)
+    out.append("\n※ 조문 원문은 get_treaty_article, 키워드 검색은 search_treaties.")
     return "\n".join(out)
 
 
@@ -421,7 +436,8 @@ def t_search_treaties(args: dict) -> str:
         )
     out.append(
         "\n※ 조문 전문은 get_treaty_article(country, article_number)로 조회. "
-        "본문은 개정 반영 통합본 기준이며, 협약·의정서 발효 이력은 list_treaties(country)로 확인."
+        "본문에 개정의정서가 반영되지 않았을 수 있으니 "
+        "list_treaties(country)로 협약·의정서 이력을 함께 확인할 것."
     )
     return "\n\n".join(out)
 
@@ -433,7 +449,7 @@ def t_get_treaty_article(args: dict) -> str:
         "MATCH (t:Treaty)-[:CONTAINS]->(a:TreatyArticle) "
         "WHERE a.country CONTAINS $c AND a.article_number = $no "
         "RETURN a.country AS c, a.article_title AS title, a.content AS kr, "
-        "a.content_en AS en, t.treaty_url AS url "
+        "a.content_en AS en, t.treaty_url AS url, t.treaty_name AS tname "
         "LIMIT 1",
         {"c": country, "no": no},
     )
@@ -460,17 +476,17 @@ def t_get_treaty_article(args: dict) -> str:
     if en:
         out += ["", "## 영문본", en[:4000] + ("…" if len(en) > 4000 else "")]
     recs = _treaty_records(r["c"])
+    out.append(f"\n## 본문 출처\n국세법령정보시스템 조세조약 본문 — 수록 조약: {r['tname']}")
     if len(recs) > 1:
         out.append("\n## 해당국 협약·의정서 이력")
         for x in recs:
-            mark = " (조문 수록본)" if x["arts"] else ""
+            mark = " (본문 수록)" if x["arts"] else ""
             out.append(f"- 발효 {fmt_date(x['ed']) or '-'} · {x['name']}{mark}")
+    warn = _amendment_warning(recs)
+    if warn:
+        out.append("\n" + warn)
     if r["url"]:
         out.append(f"\n출처: {r['url']}")
-    out.append(
-        "※ 본문은 개정의정서가 반영된 통합본 기준. 발효 시점이 쟁점이면 위 이력과 "
-        "law.go.kr 원문을 확인할 것."
-    )
     return "\n".join(out)
 
 
@@ -566,7 +582,7 @@ TOOLS = [
     },
     {
         "name": "search_treaties",
-        "description": "조세조약(이중과세방지협약) 조문을 전문검색한다. 비거주자·외국법인의 원천징수 제한세율, 고정사업장, 사용료·배당·이자 과세권 확인에 사용. country로 특정국 한정 가능. 조문 본문은 개정 반영 통합본 기준.",
+        "description": "조세조약(이중과세방지협약) 조문을 전문검색한다. 비거주자·외국법인의 원천징수 제한세율, 고정사업장, 사용료·배당·이자 과세권 확인에 사용. country로 특정국 한정 가능. 본문에 개정의정서가 반영되지 않았을 수 있어 list_treaties로 이력 확인 필요.",
         "inputSchema": {
             "type": "object",
             "properties": {
