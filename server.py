@@ -39,7 +39,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.3.2"
+SERVER_VERSION = "0.4.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -405,6 +405,16 @@ def t_list_treaties(args: dict) -> str:
             f"- {r['name']}\n  서명 {fmt_date(r['sd']) or '-'} · "
             f"발효 {fmt_date(r['ed']) or '-'}{tag}"
         )
+    annex = _annexes(country)
+    if annex:
+        out.append(f"\n부속문서 {len(annex)}건 (개정의정서·교환각서·전문 등):")
+        for a in annex:
+            date = f" · {fmt_date(a['d'])}" if a["d"] else ""
+            tag = " [개정]" if a["kind"] == "개정" else ""
+            out.append(f"- {a['title']}{date}{tag}")
+        out.append(
+            '  → 전문은 get_treaty_article(country, article_number="<부속문서 제목>")'
+        )
     warn = _amendment_warning(recs)
     if warn:
         out.append("\n" + warn)
@@ -442,26 +452,86 @@ def t_search_treaties(args: dict) -> str:
     return "\n\n".join(out)
 
 
+def _annexes(country: str) -> list:
+    return cypher(
+        "MATCH (a:TreatyArticle) WHERE a.country CONTAINS $c AND a.is_annex = true "
+        "RETURN a.article_number AS title, coalesce(a.annex_date, '') AS d, "
+        "coalesce(a.annex_kind, '') AS kind ORDER BY d DESC, title",
+        {"c": country},
+    )
+
+
+def _amendments_of(article_id: str) -> list:
+    """이 조문을 고치는 부속문서. 해당 조문을 언급한 대목까지 함께 가져온다."""
+    return cypher(
+        "MATCH (x:TreatyArticle)-[:AMENDS]->(y:TreatyArticle {treaty_article_id: $id}) "
+        "RETURN x.article_number AS title, coalesce(x.annex_date, '') AS d, "
+        "coalesce(x.content, '') AS body ORDER BY d DESC",
+        {"id": article_id},
+    )
+
+
+_AMEND_ANCHOR = "(?:협약|협정|조세조약|조세협약|이중과세방지협정|이중과세방지협약)"
+
+
+def amend_excerpt(body: str, article_no: str) -> str:
+    """개정 문서에서 그 조문을 고친다고 말한 대목을 잘라 낸다."""
+    num = re.sub(r"[^0-9]", "", article_no)
+    if not num:
+        return ""
+    m = re.search(_AMEND_ANCHOR + r"[^\n]{0,40}?제\s*" + num + r"\s*조", body or "")
+    if not m:
+        return ""
+    chunk = (body or "")[m.start():m.start() + 420]
+    return clip(chunk, 420)
+
+
 def t_get_treaty_article(args: dict) -> str:
     country = str(args["country"]).strip()
-    no = norm_article_no(args["article_number"])
+    raw = str(args["article_number"]).strip()
+    no = norm_article_no(raw)
     rows = cypher(
         "MATCH (t:Treaty)-[:CONTAINS]->(a:TreatyArticle) "
         "WHERE a.country CONTAINS $c AND a.article_number = $no "
-        "RETURN a.country AS c, a.article_title AS title, a.content AS kr, "
-        "a.content_en AS en, t.treaty_url AS url, t.treaty_name AS tname "
+        "AND coalesce(a.is_annex, false) = false "
+        "RETURN a.treaty_article_id AS aid, a.country AS c, a.article_title AS title, "
+        "a.content AS kr, a.content_en AS en, t.treaty_url AS url, t.treaty_name AS tname "
         "LIMIT 1",
         {"c": country, "no": no},
     )
     if not rows:
+        # 조문 번호가 아니면 부속문서 제목으로 본다 ('개정 의정서', '교환각서' …)
+        rows = cypher(
+            "MATCH (t:Treaty)-[:CONTAINS]->(a:TreatyArticle) "
+            "WHERE a.country CONTAINS $c AND a.is_annex = true "
+            "AND a.article_number CONTAINS $n "
+            "RETURN a.treaty_article_id AS aid, a.country AS c, a.article_number AS title, "
+            "a.content AS kr, a.content_en AS en, t.treaty_url AS url, t.treaty_name AS tname "
+            "ORDER BY coalesce(a.annex_date, '') DESC LIMIT 1",
+            {"c": country, "n": raw},
+        )
+        if rows:
+            r = rows[0]
+            out = [f"# {r['c']} 조세조약 부속문서 — {r['title']}", "",
+                   (r["kr"] or "").strip() or "(국문본 없음)"]
+            en = (r["en"] or "").strip()
+            if en:
+                out += ["", "## 영문본", en[:4000] + ("…" if len(en) > 4000 else "")]
+            if r["url"]:
+                out.append(f"\n출처: {r['url']}")
+            return "\n".join(out)
+    if not rows:
         near = cypher(
             "MATCH (a:TreatyArticle) WHERE a.country CONTAINS $c "
+            "AND coalesce(a.is_annex, false) = false "
             "RETURN a.article_number AS n, a.article_title AS t ORDER BY a.seq LIMIT 30",
             {"c": country},
         )
         if near:
             listing = ", ".join(f"{r['n']} {r['t'] or ''}".strip() for r in near)
-            return f"'{country} {no}' 조문 없음. 수록 조문: {listing} …"
+            annex = _annexes(country)
+            tail = ("\n부속문서: " + ", ".join(a["title"] for a in annex)) if annex else ""
+            return f"'{country} {no}' 조문 없음. 수록 조문: {listing} …{tail}"
         return (
             f"'{country} {no}' 조약 조문을 찾지 못함. "
             "list_treaties로 체결·수록 여부를 먼저 확인하세요."
@@ -475,6 +545,25 @@ def t_get_treaty_article(args: dict) -> str:
     en = (r["en"] or "").strip()
     if en:
         out += ["", "## 영문본", en[:4000] + ("…" if len(en) > 4000 else "")]
+
+    amends = _amendments_of(r["aid"])
+    if amends:
+        out.append(f"\n## ⚠ 이 조문을 개정한 부속문서 {len(amends)}건")
+        out.append(
+            "위 본문은 국세법령정보시스템이 주는 협약 원문이라 아래 개정이 반영돼 있지 "
+            "않다. 제한세율 등 수치는 개정문을 먼저 확인할 것."
+        )
+        for a in amends:
+            head = f"- {a['title']}" + (f" (발효 {fmt_date(a['d'])})" if a["d"] else "")
+            out.append(head)
+            ex = amend_excerpt(a["body"], no)
+            if ex:
+                out.append(f"  발췌: {ex}")
+            out.append(
+                f'  전문: get_treaty_article(country="{r["c"]}", '
+                f'article_number="{a["title"]}")'
+            )
+
     recs = _treaty_records(r["c"])
     out.append(f"\n## 본문 출처\n국세법령정보시스템 조세조약 본문 — 수록 조약: {r['tname']}")
     if len(recs) > 1:
@@ -482,9 +571,10 @@ def t_get_treaty_article(args: dict) -> str:
         for x in recs:
             mark = " (본문 수록)" if x["arts"] else ""
             out.append(f"- 발효 {fmt_date(x['ed']) or '-'} · {x['name']}{mark}")
-    warn = _amendment_warning(recs)
-    if warn:
-        out.append("\n" + warn)
+    if not amends:
+        warn = _amendment_warning(recs)
+        if warn:
+            out.append("\n" + warn)
     if r["url"]:
         out.append(f"\n출처: {r['url']}")
     return "\n".join(out)
