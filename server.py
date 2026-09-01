@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 from collections import defaultdict, deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPT_DIR)
@@ -39,7 +40,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -52,6 +53,8 @@ INSTRUCTIONS = (
     "한국 세법 법령 그래프 DB입니다. 국세·지방세 현행 조문(법률·시행령·시행규칙), 판례, "
     "조세심판원 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
     "조문은 '현행 시행 버전' 기준이며 각 결과에 시행일이 표기됩니다. "
+    "세율·기준금액이 별표에 위임된 경우가 많으니 get_article이 별표를 가리키면 get_annex로 확인하고, "
+    "미래 과세기간이 걸린 질문은 list_upcoming으로 시행예정 개정을 확인하세요. "
     "수록 법령 목록은 list_laws로, 조세조약 체결국은 list_treaties로 확인하세요"
     "(미수록 법령은 국가법령정보센터 law.go.kr 참조). "
     "국내 조문과 조약이 충돌하면 조약이 우선하므로, 비거주자·외국법인 쟁점은 "
@@ -262,6 +265,35 @@ def t_get_article(args: dict) -> str:
         out.append("\n## 위임 하위법령 조문")
         for d in deleg:
             out.append(f"- {d['law']} {d['no']} {d['title'] or ''}")
+
+    annex = cypher(
+        "MATCH (a:Article {article_id: $aid})-[:HAS_ANNEX]->(x:Annex) "
+        "RETURN x.annex_number AS no, x.annex_title AS title, "
+        "size(coalesce(x.content, '')) AS len ORDER BY x.annex_number",
+        {"aid": r["aid"]},
+    )
+    if annex:
+        # 세율표·기준금액이 별표에 있으면 조문만 읽어서는 숫자가 안 나온다
+        out.append("\n## 이 조문이 위임한 별표")
+        for x in annex:
+            out.append(f"- [{x['no']}] {x['title']} ({x['len']:,}자)")
+        out.append(f'  → 본문은 get_annex(law_name="{r["law"]}", annex_number="<별표 N>")')
+
+    upcoming = cypher(
+        "MATCH (a:Article {article_id: $aid})-[:HAS_UPCOMING]->(u:UpcomingArticle) "
+        "RETURN u.enforcement_date AS d, u.change_type AS kind, u.content AS content "
+        "ORDER BY d",
+        {"aid": r["aid"]},
+    )
+    if upcoming:
+        out.append(f"\n## ⚠ 시행예정 개정 {len(upcoming)}건")
+        out.append("위 본문은 **현행**이다. 아래 시행일 이후 사안이면 개정문으로 판단할 것.")
+        for u in upcoming:
+            out.append(f"\n### {fmt_date(u['d'])} 시행 ({u['kind']})")
+            out.append(clip(u["content"], 1200))
+        out.append("\n※ 시행예정 조문은 공포됐으나 아직 시행 전이다. 과세기간·거래일이 "
+                   "시행일 전이면 위 현행 조문이 적용된다.")
+
     out.append(f"\n출처: {r['law']} {r['no']} (시행 {fmt_date(r['enf'])} 기준)")
     return "\n".join(out)
 
@@ -339,6 +371,116 @@ def t_search_interpretations(args: dict) -> str:
         out.append(f"[{head}] {r['title'] or ''}\n  {clip(r['preview'], 320)}")
     out.append("\n※ 해석례는 개별 사실관계 전제임. 문서번호로 원문 확인 요망.")
     return "\n\n".join(out)
+
+
+
+# ---------------------------------------------------------------- 별표·시행예정
+
+def t_search_annexes(args: dict) -> str:
+    q = lucene_escape(str(args["query"]))
+    law = args.get("law_name")
+    limit = min(int(args.get("limit", 5)), 15)
+    rows = cypher(
+        "CALL db.index.fulltext.queryNodes('annex_content_ft', $q) YIELD node, score "
+        "WHERE ($law IS NULL OR node.law_name CONTAINS $law) "
+        "RETURN node.law_name AS law, node.annex_number AS no, node.annex_title AS title, "
+        "node.annex_type AS kind, size(coalesce(node.content, '')) AS len, "
+        "substring(coalesce(node.content, ''), 0, 240) AS preview, score "
+        "ORDER BY score DESC LIMIT $limit",
+        {"q": q, "law": law, "limit": limit},
+    )
+    if not rows:
+        return (
+            "검색 결과 없음. 별표는 세율표·기준금액·분류표가 많다 — "
+            "'간이세액표', '미가공식료품', '과태료' 같은 표 제목 낱말로 시도해 보세요."
+        )
+    out = []
+    for r in rows:
+        out.append(
+            f"[{r['law']} {r['no']}] {r['title']} ({r['len']:,}자)\n  {clip(r['preview'], 240)}"
+        )
+    out.append('\n※ 본문 전체는 get_annex(law_name, annex_number="별표 N")로 조회.')
+    return "\n\n".join(out)
+
+
+def t_get_annex(args: dict) -> str:
+    law = str(args["law_name"]).strip()
+    no = str(args["annex_number"]).strip()
+    if not re.match(r"^(별표|서식)", no):
+        no = f"별표 {no.lstrip('제').rstrip('호')}".strip()
+    rows = cypher(
+        "MATCH (x:Annex) WHERE x.law_name CONTAINS $law "
+        "AND replace(x.annex_number, ' ', '') = replace($no, ' ', '') "
+        "RETURN x.law_name AS law, x.annex_number AS no, x.annex_title AS title, "
+        "x.content AS content, x.hwp_url AS hwp, x.pdf_url AS pdf, "
+        "x.related_articles AS arts LIMIT 1",
+        {"law": law, "no": no},
+    )
+    if not rows:
+        near = cypher(
+            "MATCH (x:Annex) WHERE x.law_name CONTAINS $law "
+            "RETURN x.annex_number AS no, x.annex_title AS t ORDER BY x.annex_number LIMIT 40",
+            {"law": law},
+        )
+        if near:
+            listing = "\n".join(f"- [{r['no']}] {r['t']}" for r in near)
+            return f"'{law} {no}'를 찾지 못함. 수록 별표·서식:\n{listing}"
+        return f"'{law}'의 별표가 DB에 없음. list_laws로 법령명을 확인하세요."
+    r = rows[0]
+    body = r["content"] or ""
+    out = [f"# {r['law']} [{r['no']}] {r['title']}"]
+    if r["arts"]:
+        out.append(f"근거 조문: {', '.join(r['arts'])}")
+    out.append("")
+    LIMIT = 6000
+    out.append(body[:LIMIT])
+    if len(body) > LIMIT:
+        out.append(
+            f"\n… (전체 {len(body):,}자 중 {LIMIT:,}자만 표시. 표가 길면 "
+            "필요한 구간을 search_annexes로 좁혀 확인하거나 아래 원문 파일을 볼 것)"
+        )
+    if r["hwp"] or r["pdf"]:
+        base = "https://www.law.go.kr"
+        links = [f"{base}{u}" for u in (r["pdf"], r["hwp"]) if u]
+        out.append("\n원문 파일: " + " · ".join(links))
+    return "\n".join(out)
+
+
+def t_list_upcoming(args: dict) -> str:
+    law = args.get("law_name")
+    rows = cypher(
+        "MATCH (u:UpcomingVersion) WHERE ($law IS NULL OR u.law_name CONTAINS $law) "
+        "RETURN u.law_name AS law, u.enforcement_date AS d, u.revision_type AS kind, "
+        "u.changed_count AS n ORDER BY d, law",
+        {"law": law},
+    )
+    if not rows:
+        return (
+            "시행예정 개정 없음."
+            if law
+            else "시행예정으로 수록된 개정이 없습니다."
+        )
+    out = [f"시행예정 개정 {len(rows)}건 (공포됐으나 아직 시행 전):"]
+    for r in rows:
+        out.append(
+            f"- {fmt_date(r['d'])} 시행 · {r['law']} ({r['kind']}) — 달라지는 조문 {r['n']}개"
+        )
+    detail = cypher(
+        "MATCH (u:UpcomingVersion)-[:CONTAINS]->(ua:UpcomingArticle) "
+        "WHERE ($law IS NULL OR u.law_name CONTAINS $law) "
+        "RETURN ua.law_name AS law, ua.enforcement_date AS d, "
+        "ua.article_number AS no, ua.article_title AS title, ua.change_type AS kind "
+        "ORDER BY d, law, no LIMIT 60",
+        {"law": law},
+    )
+    if detail:
+        out.append("\n달라지는 조문:")
+        for x in detail:
+            out.append(
+                f"- {fmt_date(x['d'])} · {x['law']} {x['no']} {x['title']} [{x['kind']}]"
+            )
+        out.append("\n※ 개정문 본문은 get_article로 그 조문을 조회하면 함께 나온다.")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- 조세조약
@@ -657,6 +799,47 @@ TOOLS = [
             "additionalProperties": False,
         },
         "fn": t_search_interpretations,
+    },
+    {
+        "name": "search_annexes",
+        "description": "법령 별표·서식을 전문검색한다. 세율표·기준금액·한도·분류표는 조문이 아니라 별표에 있는 경우가 많다 (예: 근로소득 간이세액표, 면세 미가공식료품 분류표).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "검색어 (표 제목·항목 낱말)"},
+                "law_name": {"type": "string", "description": "법령명 필터 (부분 일치)"},
+                "limit": {"type": "integer", "description": "기본 5, 최대 15"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "fn": t_search_annexes,
+    },
+    {
+        "name": "get_annex",
+        "description": "특정 별표·서식의 본문을 반환한다. 조문이 '별표 N에 따른다'로 위임한 세율·기준금액을 확인할 때 사용.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "law_name": {"type": "string", "description": "법령명 (예: '소득세법 시행령')"},
+                "annex_number": {"type": "string", "description": "'별표 2', '별표 1의3', '서식 1' 또는 숫자만"},
+            },
+            "required": ["law_name", "annex_number"],
+            "additionalProperties": False,
+        },
+        "fn": t_get_annex,
+    },
+    {
+        "name": "list_upcoming",
+        "description": "공포됐으나 아직 시행 전인 개정(시행예정)을 반환한다. 시행일·법령·달라지는 조문 목록. 미래 과세기간이 걸린 질문에서 현행 조문만 보고 답하지 않도록 확인용.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "law_name": {"type": "string", "description": "법령명 필터 (생략 시 전체)"},
+            },
+            "additionalProperties": False,
+        },
+        "fn": t_list_upcoming,
     },
     {
         "name": "list_treaties",
@@ -980,8 +1163,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_empty(202)
 
 
+class Server(ThreadingHTTPServer):
+    """기동 시 역방향 DNS를 조회하지 않는 HTTP 서버.
+
+    HTTPServer.server_bind() 는 socket.getfqdn(host) 로 서버 이름을 채운다. DNS가
+    느리거나 막힌 환경에서는 그 한 줄에서 몇 분씩 멈춰 포트가 열리지 않는다
+    (2026-09-01 launchd 아래에서 실제로 겪었다 — 셸에서는 멀쩡했다).
+    server_name 은 응답에 쓰지 않으므로 조회 없이 채운다.
+    """
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 def main():
-    httpd = ThreadingHTTPServer((BIND, PORT), Handler)
+    httpd = Server((BIND, PORT), Handler)
     httpd.daemon_threads = True
     print(f"[{SERVER_NAME}] listening on {BIND}:{PORT} (neo4j: {NEO4J_HTTP})")
     httpd.serve_forever()
