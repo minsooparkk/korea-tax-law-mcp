@@ -11,7 +11,7 @@
 
 실행:  python3 mcp/server.py            (기본 127.0.0.1:8788)
        PORT=9000 python3 mcp/server.py
-엔드포인트: POST /mcp  (Cloudflare Tunnel 뒤에서 mcp.taxjarvis.com/mcp 로 공개)
+엔드포인트: POST /mcp  (Cloudflare Tunnel 뒤에서 mcp.taxdoctorai.com/mcp 로 공개)
 참고: scripts/tax_db_mcp.py(사설망 Tailscale 전용, 서브프로세스 방식)와는 별개 서비스다.
 이 서버는 공개용으로 read-only 파라미터 쿼리 + rate limit + 사용량 로그를 갖춤.
 """
@@ -40,7 +40,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.5.1"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 

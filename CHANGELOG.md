@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## v0.5.1 (2026-09-02)
+
+**엔드포인트 주소 변경** — 서비스 도메인이 taxjarvis.com에서 taxdoctorai.com으로
+넘어가면서 공개 MCP 주소도 `https://mcp.taxdoctorai.com/mcp`로 바꿨다.
+옛 주소 `mcp.taxjarvis.com`은 당분간 같은 서버를 그대로 가리킨다.
+
 ## v0.5.0 (2026-09-01)
 
 **별표·서식과 시행예정 개정 추가** — 조문만으로는 답이 안 나오는 두 구멍을 메웠다.

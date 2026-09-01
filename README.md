@@ -7,7 +7,7 @@
 
 국가법령정보센터에서 직접 API로 호출하는 것이 아니라, Graph DB로 세법 DB를 다시 설계하여 AI로 하여금 법률 추론의 효과성/효율성을 극대화할 수 있도록 한 DB입니다.
 ```
-https://mcp.taxjarvis.com/mcp
+https://mcp.taxdoctorai.com/mcp
 ```
 
 ## 왜 필요한가
@@ -35,26 +35,26 @@ https://mcp.taxjarvis.com/mcp
 
 ## 연결 방법
 
-**Claude** (웹/데스크톱): 설정 → Connectors → Add custom connector → `https://mcp.taxjarvis.com/mcp`
+**Claude** (웹/데스크톱): 설정 → Connectors → Add custom connector → `https://mcp.taxdoctorai.com/mcp`
 
 **Claude Code**:
 ```bash
-claude mcp add --transport http korea-tax-law https://mcp.taxjarvis.com/mcp
+claude mcp add --transport http korea-tax-law https://mcp.taxdoctorai.com/mcp
 ```
 
 **Codex CLI** (`~/.codex/config.toml`):
 ```toml
 [mcp_servers.korea-tax-law]
-url = "https://mcp.taxjarvis.com/mcp"
+url = "https://mcp.taxdoctorai.com/mcp"
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`):
 ```json
-{"mcpServers": {"korea-tax-law": {"httpUrl": "https://mcp.taxjarvis.com/mcp"}}}
+{"mcpServers": {"korea-tax-law": {"httpUrl": "https://mcp.taxdoctorai.com/mcp"}}}
 ```
 
-**구형 SSE 전용 클라이언트**: `https://mcp.taxjarvis.com/sse`
-**stdio 전용 클라이언트**: `npx -y mcp-remote https://mcp.taxjarvis.com/mcp`
+**구형 SSE 전용 클라이언트**: `https://mcp.taxdoctorai.com/sse`
+**stdio 전용 클라이언트**: `npx -y mcp-remote https://mcp.taxdoctorai.com/mcp`
 
 ## 수록 범위
 
