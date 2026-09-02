@@ -212,7 +212,14 @@ NEO4J_HTTP=http://127.0.0.1:7474 NEO4J_USER=neo4j NEO4J_PASSWORD=... PORT=8788 p
 
 단, 같은 스키마의 Neo4j 그래프 DB가 필요합니다 (Law/Article/Case/Interpretation/Treaty/TreatyArticle 노드 + 풀텍스트 인덱스). 데이터 수집 파이프라인은 이 리포에 포함되어 있지 않으므로, 일반 사용자는 호스팅 엔드포인트 사용을 권장합니다.
 
-기본 방어 설정: IP당 분당 30회, 동시 쿼리 4개, 쿼리 타임아웃 8초, read-only.
+기본 방어 설정: 도구 호출 IP당 분당 30회(`RATE_PER_MIN`), 핸드셰이크(`initialize`·
+`tools/list`) IP당 분당 20회(`HANDSHAKE_PER_MIN`), 동시 쿼리 4개, 쿼리 타임아웃 8초,
+read-only.
+
+도구는 한 번도 안 부르고 `initialize`+`tools/list`만 반복하는 디렉터리 스캐너가
+붙으면, `server.py`의 `BLOCKED_NETS`에 해당 IP나 대역을 넣어 403으로 끊을 수 있습니다
+(기본값은 빈 목록). 대상은 `logs/usage-*.jsonl`을 IP×메서드로 갈라 `tools/call`이
+0건인 IP를 찾으면 됩니다.
 
 ## 주의
 

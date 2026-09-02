@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import queue
@@ -40,11 +41,20 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.5.1"
+SERVER_VERSION = "0.6.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
-RATE_PER_MIN = 30          # IP당 분당 호출 한도
+RATE_PER_MIN = 30          # IP당 분당 tools/call 한도
+HANDSHAKE_PER_MIN = 20     # IP당 분당 initialize+tools/list 한도 (정상 클라이언트는 연결당 2회)
+
+# 하드 차단할 IP/대역. 운영자가 자기 로그를 보고 채운다 — 기본값은 비어 있다.
+# IPv4/IPv6 프리픽스 표기를 모두 받는다. 예: ["203.0.113.4/32", "2001:db8::/64"]
+#
+# 채울 대상은 도구 호출 0건에 initialize/tools/list만 무한 반복하는 MCP 디렉터리
+# 스캐너다. usage 로그를 IP×메서드로 갈라 tools/call이 0인 IP를 찾으면 된다.
+# 주의: 160.79.106.0/24는 Anthropic 이그레스(= claude.ai 실사용자)이므로 넣지 말 것.
+BLOCKED_NETS: list[str] = []
 GLOBAL_CONCURRENCY = 4     # 동시 Neo4j 쿼리 한도
 NEO4J_TIMEOUT = 8          # 쿼리 타임아웃(초)
 MAX_BODY = 64 * 1024       # 요청 본문 한도
@@ -887,17 +897,29 @@ TOOL_MAP = {t["name"]: t for t in TOOLS}
 
 # ---------------------------------------------------------------- rate limit / 로그
 
+_BLOCKED = [ipaddress.ip_network(n) for n in BLOCKED_NETS]
+
+
+def ip_blocked(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _BLOCKED)
+
+
 _rate_lock = threading.Lock()
 _rate: dict[str, deque] = defaultdict(deque)
 
 
-def rate_ok(ip: str) -> bool:
+def rate_ok(ip: str, bucket: str = "call", limit: int = RATE_PER_MIN) -> bool:
     now = time.time()
+    key = f"{bucket}:{ip}"
     with _rate_lock:
-        q = _rate[ip]
+        q = _rate[key]
         while q and now - q[0] > 60:
             q.popleft()
-        if len(q) >= RATE_PER_MIN:
+        if len(q) >= limit:
             return False
         q.append(now)
         if len(_rate) > 10000:  # 메모리 보호
@@ -935,6 +957,12 @@ def handle_message(msg: dict, ip: str):
     params = msg.get("params") or {}
     if id_ is None:
         return None
+
+    if method in ("initialize", "tools/list") and not rate_ok(
+        ip, "handshake", HANDSHAKE_PER_MIN
+    ):
+        log_usage(ip, method, "", 0, "rate_limited")
+        return rpc_error(id_, -32000, "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요.")
 
     if method == "initialize":
         client_proto = str(params.get("protocolVersion", DEFAULT_PROTOCOL))
@@ -1017,6 +1045,15 @@ class Handler(BaseHTTPRequestHandler):
             or self.client_address[0]
         )
 
+    def reject_blocked(self, ip: str) -> bool:
+        """차단 IP면 403으로 끊고 True. 로그는 IP당 분당 1줄로 눌러 통계 오염을 막는다."""
+        if not ip_blocked(ip):
+            return False
+        if rate_ok(ip, "blocklog", 1):
+            log_usage(ip, "", "", 0, "blocked")
+        self.send_json({"error": "Forbidden"}, 403)
+        return True
+
     def send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
@@ -1069,6 +1106,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"status": "degraded", "server": SERVER_NAME}, 503)
             return
         if path == "/sse":
+            if self.reject_blocked(self.client_ip()):
+                return
             self.legacy_sse()
             return
         # /mcp GET: 서버 주도 스트림 미지원 (stateless) — 스펙상 405 허용
@@ -1076,6 +1115,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         ip = self.client_ip()
+        if self.reject_blocked(ip):
+            return
         path = urlparse(self.path).path.rstrip("/")
         if path == "/messages":
             self.legacy_messages(ip)
