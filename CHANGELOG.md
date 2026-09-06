@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## v0.7.0 (2026-09-06)
+
+**현행 검증 그래프 소비** — 공유 Neo4j가 국세청 조세법령 목록 현행 90 + 목록 역사 2
+범위의 검증 링크로 갱신됐다. MCP는 같은 DB를 읽기만 하며, 수집·적재는 하지 않는다.
+
+- 위임(`DELEGATES_TO`/`DELEGATED_FROM`)·별표(`HAS_ANNEX`)·문서 인용
+  (`HAS_CASE`/`HAS_INTERPRETATION`/`HAS_RULING`)은 활성·검증되고 원천 스냅샷이
+  맞는 관계만 따른다. 비활성 CONTAINS·삭제 조문은 현행 조회에서 제외한다.
+- `get_article`이 검증된 상위·하위 위임, 별표, 인용(각 최대 5건)과 원천 스냅샷을
+  붙인다. 인용은 적용 확정이 아니며 `resolved_version_id`가 없으면 현행 적용으로
+  메우지 않는다.
+- `get_article_history`는 버전별 검증·원천 여부를 표시한다. 미검증 버전은
+  적용 단정에 쓰지 말라고 적는다.
+- `list_laws`는 `is_current`에 더해 목록 역사·예정 법령을 제외한다.
+- `search_cases`/`search_interpretations` 키워드 히트는 검증된 인용이 아님을
+  명시한다. 도구 이름·필수 인자는 그대로다.
+- 수록 범위 문서를 현행 90개 법령·검증 수리 결과(remaining 293,581 재검증 0 오류)에
+  맞춘다. 물리 노드·관계 건수는 의미 확정이 아니다.
+- `search_annexes`/`get_annex`/근처 목록 폴백은 `current_annex_guard`로 닫힌다.
+  `is_current` 누락은 현행이 아니고, 현행 Law에 `law_id`와 검증된 소유 엣지·원천
+  스냅샷으로 묶는다. 삭제 노드는 세 경로 모두에서 숨긴다.
+
 ## v0.6.0 (2026-09-03)
 
 **스캐너 차단과 핸드셰이크 레이트리밋** — 레이트리밋이 `tools/call`에만 걸려 있어서

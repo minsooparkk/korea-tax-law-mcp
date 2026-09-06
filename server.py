@@ -9,11 +9,11 @@
 - 방어: IP당 분당 호출 제한, 전역 동시 쿼리 제한, 쿼리 타임아웃
 - 로그: logs/mcp/usage-YYYYMMDD.jsonl
 
-실행:  python3 mcp/server.py            (기본 127.0.0.1:8788)
-       PORT=9000 python3 mcp/server.py
+실행:  python3 server.py            (기본 127.0.0.1:8788)
+       PORT=9000 python3 server.py
 엔드포인트: POST /mcp  (Cloudflare Tunnel 뒤에서 mcp.taxdoctorai.com/mcp 로 공개)
-참고: scripts/tax_db_mcp.py(사설망 Tailscale 전용, 서브프로세스 방식)와는 별개 서비스다.
 이 서버는 공개용으로 read-only 파라미터 쿼리 + rate limit + 사용량 로그를 갖춤.
+공유 로컬 Neo4j의 현행 검증 그래프만 읽는다. 수집·적재·DB 쓰기는 이 리포의 범위가 아니다.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -60,13 +60,17 @@ NEO4J_TIMEOUT = 8          # 쿼리 타임아웃(초)
 MAX_BODY = 64 * 1024       # 요청 본문 한도
 
 INSTRUCTIONS = (
-    "한국 세법 법령 그래프 DB입니다. 국세·지방세 현행 조문(법률·시행령·시행규칙), 판례, "
+    "한국 세법 법령 그래프 DB입니다. 국세청 조세법령 목록의 현행 법·령·칙, 판례, "
     "조세심판원 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
     "조문은 '현행 시행 버전' 기준이며 각 결과에 시행일이 표기됩니다. "
+    "위임·별표·문서 인용은 활성·검증되고 원천 스냅샷이 맞는 관계만 따릅니다. "
+    "키워드 검색 히트는 검증된 인용이 아니고, 인용은 적용 확정이 아닙니다. "
+    "resolved_version_id가 없거나 시점이 unresolved이면 현행 조문 적용을 단정하지 마세요. "
     "세율·기준금액이 별표에 위임된 경우가 많으니 get_article이 별표를 가리키면 get_annex로 확인하고, "
     "미래 과세기간이 걸린 질문은 list_upcoming으로 시행예정 개정을 확인하세요. "
     "수록 법령 목록은 list_laws로, 조세조약 체결국은 list_treaties로 확인하세요"
     "(미수록 법령은 국가법령정보센터 law.go.kr 참조). "
+    "목록의 역사 법령은 현행 그래프에서 제외됩니다. "
     "국내 조문과 조약이 충돌하면 조약이 우선하므로, 비거주자·외국법인 쟁점은 "
     "국내법 조문과 해당국 조약 조문을 함께 확인하세요. "
     "제공 정보는 실무 참고용이며 공식 유권해석이 아닙니다."
@@ -161,33 +165,406 @@ def clip(s, n=300) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+# ---------------------------------------------------------------- 검증 그래프 가드
+# tax-ai-agent ad94f69 `src/search/edge_provenance.py` 의 MCP 소비용 부분집합.
+# 비활성·미검증·스냅샷 불일치·삭제 끝점은 인용으로 쓰지 않는다.
+# 물리 관계 건수는 의미 확정이 아니다.
+
+DOCUMENT_PROJECTION_SCHEMA = "tax-document-projection-v1"
+DOCUMENT_PROJECTION_KIND = "stored_document_projection"
+DOCUMENT_PROJECTION_SNAPSHOT_PREFIX = "stored-document:v1:sha256:"
+CITATION_LIMIT = 5
+
+
+def _and(*parts: str) -> str:
+    return " AND ".join(part for part in parts if part)
+
+
+def _nonempty(expr: str) -> str:
+    return f"({expr} IS NOT NULL AND {expr} <> '')"
+
+
+def _same_nonempty(left: str, right: str) -> str:
+    return f"{left} = {right} AND {left} <> ''"
+
+
+def current_law_guard(*, law: str = "l") -> str:
+    """현행 목록만. 역사·예정 법령은 현행 그래프 소비자 경로에서 제외."""
+    return _and(
+        f"{law}.is_current = true",
+        f"coalesce({law}.publication_status, '') <> 'historical'",
+        f"coalesce({law}.publication_status, '') <> 'scheduled'",
+    )
+
+
+def active_verified_guard(*, edge: str) -> str:
+    return f"{edge}.active = true AND {edge}.verified = true"
+
+
+def current_article_guard(*, node: str = "a") -> str:
+    """삭제 표시가 있는 현행 끝점은 쓰지 않는다."""
+    return (
+        f"{node}.is_current = true AND "
+        f"coalesce({node}.deleted, false) = false AND "
+        f"coalesce({node}.is_deleted, false) = false"
+    )
+
+
+def current_annex_guard(*, node: str = "x") -> str:
+    """현행 별표만. is_current 누락은 현행이 아니다."""
+    return (
+        f"{node}.is_current = true AND "
+        f"coalesce({node}.deleted, false) = false AND "
+        f"coalesce({node}.is_deleted, false) = false"
+    )
+
+
+def current_contains_guard(*, edge: str = "owns", law: str = "l") -> str:
+    """검증된 현행 Law 소유. 비활성 CONTAINS는 증거가 아니다."""
+    return _and(
+        active_verified_guard(edge=edge),
+        _same_nonempty(f"{edge}.source_snapshot", f"{law}.source_snapshot"),
+    )
+
+
+def official_document_snapshot(*, document: str) -> str:
+    """공식 스냅샷. 빈 문자열은 없음으로 보고, 엣지 해시로 메우지 않는다."""
+    return (
+        f"coalesce(nullif({document}.source_snapshot, ''), "
+        f"{document}.source_projection_snapshot)"
+    )
+
+
+def document_projection_guard(*, document: str, edge: str) -> str:
+    schema = DOCUMENT_PROJECTION_SCHEMA
+    kind = DOCUMENT_PROJECTION_KIND
+    prefix = DOCUMENT_PROJECTION_SNAPSHOT_PREFIX
+    return _and(
+        f"{document}.source_projection_schema = '{schema}'",
+        f"{document}.source_projection_kind = '{kind}'",
+        (
+            f"{document}.source_projection_snapshot = '{prefix}' + "
+            f"{document}.source_projection_sha256"
+        ),
+        f"{edge}.source_projection_schema = {document}.source_projection_schema",
+        f"{edge}.source_projection_kind = {document}.source_projection_kind",
+        f"{edge}.source_projection_sha256 = {document}.source_projection_sha256",
+        f"{edge}.source_projection_snapshot = {document}.source_projection_snapshot",
+        f"{edge}.source_projection_snapshot = '{prefix}' + {edge}.source_projection_sha256",
+    )
+
+
+def document_citation_guard(*, document: str, article: str, edge: str = "rel") -> str:
+    """CITES_ARTICLE 및 역방향 HAS_CASE / HAS_RULING / HAS_INTERPRETATION.
+
+    문서가 증거 원천이다. edge.source_snapshot 은 문서를 따르고,
+    edge.target_source_snapshot 은 조문(또는 버전 노드)을 따른다.
+    """
+    return _and(
+        active_verified_guard(edge=edge),
+        document_projection_guard(document=document, edge=edge),
+        f"{edge}.source_snapshot = {official_document_snapshot(document=document)}",
+        _nonempty(f"{edge}.source_snapshot"),
+        _same_nonempty(f"{edge}.target_source_snapshot", f"{article}.source_snapshot"),
+    )
+
+
+def delegates_to_rel_guard(*, rel: str = "rel") -> str:
+    """DELEGATES_TO: upper=start, lower=end. 방향을 뒤집으면 안 된다."""
+    return _and(
+        active_verified_guard(edge=rel),
+        _same_nonempty(f"{rel}.upper_source_snapshot", f"startNode({rel}).source_snapshot"),
+        _same_nonempty(f"{rel}.lower_source_snapshot", f"endNode({rel}).source_snapshot"),
+    )
+
+
+def delegated_from_rel_guard(*, rel: str = "rel") -> str:
+    """DELEGATED_FROM: lower=start, upper=end. DELEGATES_TO 와 스냅샷 방향이 반대다."""
+    return _and(
+        active_verified_guard(edge=rel),
+        _same_nonempty(f"{rel}.lower_source_snapshot", f"startNode({rel}).source_snapshot"),
+        _same_nonempty(f"{rel}.upper_source_snapshot", f"endNode({rel}).source_snapshot"),
+    )
+
+
+def current_scoped_annex_guard(*, law: str = "l", annex: str = "x") -> str:
+    """현행 목록 Law에 law_id로 묶인 별표. 이름만으로 소유를 증명하지 않는다."""
+    return _and(
+        current_law_guard(law=law),
+        current_annex_guard(node=annex),
+        _same_nonempty(f"{annex}.law_id", f"{law}.law_id"),
+        _nonempty(f"{annex}.source_snapshot"),
+    )
+
+
+def law_annex_owner_guard(*, law: str = "l", annex: str = "x", edge: str = "owns") -> str:
+    """Law-HAS_ANNEX 공식 첨부. 스냅샷은 evidence_source_label을 따른다."""
+    return _and(
+        active_verified_guard(edge=edge),
+        (
+            f"(({edge}.evidence_source_label = 'Annex' AND "
+            f"{_same_nonempty(f'{edge}.source_snapshot', f'{annex}.source_snapshot')}) OR "
+            f"({edge}.evidence_source_label = 'Law' AND "
+            f"{_same_nonempty(f'{edge}.source_snapshot', f'{law}.source_snapshot')} AND "
+            f"{_same_nonempty(f'{edge}.target_source_snapshot', f'{annex}.source_snapshot')}))"
+        ),
+    )
+
+
+def scoped_annex_owner_exists(*, law: str = "l", annex: str = "x") -> str:
+    """활성·검증·원천이 맞는 소유 엣지. Law 또는 같은 법령의 Article."""
+    law_edge = law_annex_owner_guard(law=law, annex=annex, edge="owns")
+    art_edge = article_annex_guard(article="a", annex=annex, edge="rel")
+    return (
+        f"(EXISTS {{ MATCH ({law})-[owns:HAS_ANNEX]->({annex}) WHERE {law_edge} }} "
+        f"OR EXISTS {{ MATCH (a:Article)-[rel:HAS_ANNEX]->({annex}) "
+        f"WHERE a.law_id = {law}.law_id AND {art_edge} }})"
+    )
+
+
+def article_annex_guard(*, article: str = "a", annex: str = "x", edge: str = "rel") -> str:
+    """HAS_ANNEX 스냅샷 방향은 evidence_source_label 을 따른다."""
+    return _and(
+        active_verified_guard(edge=edge),
+        current_article_guard(node=article),
+        current_annex_guard(node=annex),
+        (
+            f"(({edge}.evidence_source_label = 'Article' AND "
+            f"{_same_nonempty(f'{edge}.source_snapshot', f'{article}.source_snapshot')} AND "
+            f"{_same_nonempty(f'{edge}.target_source_snapshot', f'{annex}.source_snapshot')}) OR "
+            f"({edge}.evidence_source_label = 'Annex' AND "
+            f"{_same_nonempty(f'{edge}.source_snapshot', f'{annex}.source_snapshot')} AND "
+            f"{_same_nonempty(f'{edge}.target_source_snapshot', f'{article}.source_snapshot')}))"
+        ),
+    )
+
+
+def article_version_citation_guard(
+    *, document: str, version: str = "v", edge: str = "rel"
+) -> str:
+    """CITES_ARTICLE_VERSION — 검증되고 원천이 있는 ArticleVersion 만."""
+    return _and(
+        document_citation_guard(document=document, article=version, edge=edge),
+        f"{edge}.resolved_version_id = {version}.version_id",
+        f"{version}.verified = true",
+        _nonempty(f"{version}.source_snapshot"),
+        _nonempty(f"{version}.version_id"),
+    )
+
+
+def fmt_uncertainty(temporal_resolution, resolved_version_id) -> str:
+    """인용 시점·적용 버전. 없으면 현행 적용으로 메우지 않는다."""
+    bits = []
+    tr = (temporal_resolution or "").strip()
+    if tr:
+        bits.append(f"시점 {tr}")
+    else:
+        bits.append("시점 미기재")
+    vid = (str(resolved_version_id).strip() if resolved_version_id else "")
+    bits.append(f"적용버전 {vid}" if vid else "적용버전 미해소")
+    return " · ".join(bits)
+
+
+def q_current_article(cond: str) -> str:
+    return (
+        "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
+        f"WHERE {cond} AND {current_law_guard(law='l')} AND a.article_number = $no "
+        f"AND {current_article_guard(node='a')} "
+        f"AND {current_contains_guard(edge='owns', law='l')} "
+        "RETURN l.law_name AS law, l.enforcement_date AS enf, a.article_id AS aid, "
+        "a.article_number AS no, a.article_title AS title, a.article_content AS content, "
+        "l.source_snapshot AS law_snap, a.source_snapshot AS article_snap "
+        "LIMIT 1"
+    )
+
+
+Q_DELEGATES_TO = (
+    "MATCH (a:Article {article_id: $aid})-[rel:DELEGATES_TO]->(d:Article)"
+    "<-[owns:CONTAINS]-(dl:Law) "
+    f"WHERE {current_law_guard(law='dl')} "
+    f"AND {delegates_to_rel_guard(rel='rel')} "
+    f"AND {current_article_guard(node='a')} "
+    f"AND {current_article_guard(node='d')} "
+    f"AND {current_contains_guard(edge='owns', law='dl')} "
+    "RETURN DISTINCT dl.law_name AS law, d.article_number AS no, d.article_title AS title "
+    "LIMIT 10"
+)
+
+Q_DELEGATED_FROM = (
+    "MATCH (a:Article {article_id: $aid})-[rel:DELEGATED_FROM]->(p:Article)"
+    "<-[owns:CONTAINS]-(pl:Law) "
+    f"WHERE {current_law_guard(law='pl')} "
+    f"AND {delegated_from_rel_guard(rel='rel')} "
+    f"AND {current_article_guard(node='a')} "
+    f"AND {current_article_guard(node='p')} "
+    f"AND {current_contains_guard(edge='owns', law='pl')} "
+    "RETURN DISTINCT pl.law_name AS law, p.article_number AS no, p.article_title AS title "
+    "LIMIT 10"
+)
+
+Q_ARTICLE_ANNEX = (
+    "MATCH (a:Article {article_id: $aid})-[rel:HAS_ANNEX]->(x:Annex) "
+    f"WHERE {article_annex_guard(article='a', annex='x', edge='rel')} "
+    "RETURN x.annex_number AS no, x.annex_title AS title, "
+    "size(coalesce(x.content, '')) AS len ORDER BY x.annex_number"
+)
+
+Q_SEARCH_ANNEXES = (
+    "CALL db.index.fulltext.queryNodes('annex_content_ft', $q) YIELD node, score "
+    "MATCH (l:Law {law_id: node.law_id}) "
+    f"WHERE {current_scoped_annex_guard(law='l', annex='node')} "
+    "AND ($law IS NULL OR l.law_name CONTAINS $law) "
+    f"AND {scoped_annex_owner_exists(law='l', annex='node')} "
+    "RETURN l.law_name AS law, node.annex_number AS no, node.annex_title AS title, "
+    "node.annex_type AS kind, size(coalesce(node.content, '')) AS len, "
+    "substring(coalesce(node.content, ''), 0, 240) AS preview, score "
+    "ORDER BY score DESC LIMIT $limit"
+)
+
+Q_GET_ANNEX = (
+    "MATCH (x:Annex) "
+    "WHERE replace(x.annex_number, ' ', '') = replace($no, ' ', '') "
+    f"AND {current_annex_guard(node='x')} "
+    f"AND {_nonempty('x.source_snapshot')} "
+    "MATCH (l:Law {law_id: x.law_id}) "
+    f"WHERE {current_law_guard(law='l')} "
+    "AND (l.law_name = $law OR l.law_name CONTAINS $law) "
+    f"AND {scoped_annex_owner_exists(law='l', annex='x')} "
+    "RETURN l.law_name AS law, x.annex_number AS no, x.annex_title AS title, "
+    "x.content AS content, x.hwp_url AS hwp, x.pdf_url AS pdf, "
+    "x.related_articles AS arts "
+    "ORDER BY CASE WHEN l.law_name = $law THEN 0 ELSE 1 END "
+    "LIMIT 1"
+)
+
+Q_GET_ANNEX_NEAR = (
+    "MATCH (x:Annex) "
+    f"WHERE {current_annex_guard(node='x')} "
+    f"AND {_nonempty('x.source_snapshot')} "
+    "MATCH (l:Law {law_id: x.law_id}) "
+    f"WHERE {current_law_guard(law='l')} "
+    "AND (l.law_name = $law OR l.law_name CONTAINS $law) "
+    f"AND {scoped_annex_owner_exists(law='l', annex='x')} "
+    "RETURN x.annex_number AS no, x.annex_title AS t "
+    "ORDER BY x.annex_number LIMIT 40"
+)
+
+Q_VERIFIED_CITATIONS = (
+    "MATCH (a:Article {article_id: $aid}) "
+    f"WHERE {current_article_guard(node='a')} "
+    "CALL (a) { "
+    "MATCH (a)-[rel:HAS_CASE]->(c:Case) "
+    f"WHERE {document_citation_guard(document='c', article='a', edge='rel')} "
+    "RETURN 'case' AS kind, coalesce(c.court_type, '판례') AS org, "
+    "c.case_number AS no, c.ruling_date AS d, "
+    "rel.temporal_resolution AS tr, rel.resolved_version_id AS vid "
+    "ORDER BY c.ruling_date DESC LIMIT $limit "
+    "UNION ALL "
+    "MATCH (a)-[rel:HAS_INTERPRETATION]->(i:Interpretation) "
+    f"WHERE {document_citation_guard(document='i', article='a', edge='rel')} "
+    "RETURN 'interpretation' AS kind, coalesce(i.reply_org, '해석례') AS org, "
+    "i.interp_number AS no, i.reply_date AS d, "
+    "rel.temporal_resolution AS tr, rel.resolved_version_id AS vid "
+    "ORDER BY i.reply_date DESC LIMIT $limit "
+    "UNION ALL "
+    "MATCH (a)-[rel:HAS_RULING]->(r:Ruling) "
+    f"WHERE {document_citation_guard(document='r', article='a', edge='rel')} "
+    "AND (NOT r:ReferenceBook OR r.active = true) "
+    "AND (NOT r:AdminRule OR r.is_current = true) "
+    "RETURN 'ruling' AS kind, coalesce(r.ruling_org, '예규') AS org, "
+    "r.ruling_number AS no, r.ruling_date AS d, "
+    "rel.temporal_resolution AS tr, rel.resolved_version_id AS vid "
+    "ORDER BY r.ruling_date DESC LIMIT $limit "
+    "} "
+    "RETURN kind, org, no, d, tr, vid"
+)
+
+Q_ARTICLE_HISTORY = (
+    "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
+    f"WHERE l.law_name CONTAINS $law AND a.article_number = $no "
+    f"AND {current_law_guard(law='l')} "
+    f"AND {current_article_guard(node='a')} "
+    f"AND {current_contains_guard(edge='owns', law='l')} "
+    "WITH a LIMIT 1 "
+    "MATCH (a)-[:HAS_VERSION]->(v:ArticleVersion) "
+    "RETURN v.enforcement_date AS enf, v.valid_from AS vfrom, v.valid_to AS vto, "
+    "v.version_id AS vid, coalesce(v.verified, false) AS verified, "
+    "coalesce(v.source_snapshot, '') AS snap "
+    "ORDER BY v.valid_from DESC LIMIT 20"
+)
+
+Q_CURRENT_ARTICLE_MARKS = (
+    "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
+    f"WHERE l.law_name CONTAINS $law AND a.article_number = $no "
+    f"AND {current_law_guard(law='l')} "
+    f"AND {current_article_guard(node='a')} "
+    f"AND {current_contains_guard(edge='owns', law='l')} "
+    "RETURN a.article_content AS content LIMIT 1"
+)
+
+Q_SEARCH_ARTICLES_FT = (
+    "CALL db.index.fulltext.queryNodes('article_content_ft', $q) YIELD node, score "
+    "MATCH (l:Law)-[owns:CONTAINS]->(node) "
+    f"WHERE {current_law_guard(law='l')} AND ($law IS NULL OR l.law_name CONTAINS $law) "
+    f"AND {current_contains_guard(edge='owns', law='l')} "
+    f"AND {current_article_guard(node='node')} "
+    "RETURN l.law_name AS law, l.enforcement_date AS enf, node.article_number AS no, "
+    "node.article_title AS title, substring(node.article_content, 0, 260) AS preview, score "
+    "ORDER BY score DESC LIMIT $limit"
+)
+
+Q_SEARCH_ARTICLES_FALLBACK = (
+    "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
+    f"WHERE {current_law_guard(law='l')} AND ($law IS NULL OR l.law_name CONTAINS $law) "
+    f"AND {current_contains_guard(edge='owns', law='l')} "
+    f"AND {current_article_guard(node='a')} "
+    "AND (a.article_title CONTAINS $raw OR a.article_content CONTAINS $raw) "
+    "RETURN l.law_name AS law, l.enforcement_date AS enf, a.article_number AS no, "
+    "a.article_title AS title, substring(a.article_content, 0, 260) AS preview, 0 AS score "
+    "ORDER BY CASE WHEN a.article_title CONTAINS $raw THEN 0 ELSE 1 END "
+    "LIMIT $limit"
+)
+
+PROVENANCE_FOOTER = (
+    "※ 위임·별표·인용은 활성·검증·원천 스냅샷이 일치하는 관계만 표시한다. "
+    "인용은 적용 확정이 아니다. 시점 unresolved 이거나 적용버전이 없으면 "
+    "현행 조문으로 메우지 말 것."
+)
+
+
 # ---------------------------------------------------------------- 도구 구현
 
 def t_list_laws(args: dict) -> str:
     rows = cypher(
-        "MATCH (l:Law) WHERE l.is_current = true "
+        "MATCH (l:Law) WHERE " + current_law_guard(law="l") + " "
         "RETURN l.law_name AS name, l.law_type AS type, l.enforcement_date AS enf, "
-        "coalesce(l.ministry, '') AS ministry "
+        "coalesce(l.ministry, '') AS ministry, coalesce(l.instrument_type, '') AS inst "
         "ORDER BY l.law_name"
     )
     # 조세특례제한법은 소관이 '재정경제부,행정안전부' 공동이라 지방세로 세면 안 된다.
-    def kind(m):
-        if "," in m:
+    def kind(name, ministry):
+        if str(name).startswith("지방세"):
+            return "지방세"
+        if "," in ministry:
             return "공통"
-        return "지방세" if "행정안전부" in m else "국세"
+        return "지방세" if "행정안전부" in ministry else "국세"
 
     counts = {"국세": 0, "지방세": 0, "공통": 0}
     for r in rows:
-        counts[kind(r["ministry"])] += 1
+        counts[kind(r["name"], r["ministry"])] += 1
     lines = [
         f"수록 현행 법령 {len(rows)}건 "
         f"(국세 {counts['국세']} · 지방세 {counts['지방세']} · 국세/지방세 공통 {counts['공통']}):"
     ]
     for r in rows:
-        k = kind(r["ministry"])
+        k = kind(r["name"], r["ministry"])
         tag = "" if k == "국세" else f" [{k}]"
         lines.append(f"- {r['name']} ({r['type']}, 시행 {fmt_date(r['enf'])}){tag}")
-    lines.append("\n※ 목록에 없는 법령은 이 DB에 미수록. 국가법령정보센터(law.go.kr) 확인 요망.")
+    lines.append(
+        "\n※ 국세청 조세법령 목록의 현행 법·령·칙. "
+        "목록 역사 법령(자산재평가법시행령·자산재평가법시행규칙)은 현행 그래프에서 제외."
+    )
+    lines.append("※ 목록에 없는 법령은 이 DB에 미수록. 국가법령정보센터(law.go.kr) 확인 요망.")
     lines.append("※ 조세조약은 별도 수록 — list_treaties로 확인.")
     return "\n".join(lines)
 
@@ -196,15 +573,7 @@ def t_search_articles(args: dict) -> str:
     q = lucene_escape(str(args["query"]))
     law = args.get("law_name")
     limit = min(int(args.get("limit", 8)), 20)
-    rows = cypher(
-        "CALL db.index.fulltext.queryNodes('article_content_ft', $q) YIELD node, score "
-        "MATCH (l:Law)-[:CONTAINS]->(node) "
-        "WHERE l.is_current = true AND ($law IS NULL OR l.law_name CONTAINS $law) "
-        "RETURN l.law_name AS law, l.enforcement_date AS enf, node.article_number AS no, "
-        "node.article_title AS title, substring(node.article_content, 0, 260) AS preview, score "
-        "ORDER BY score DESC LIMIT $limit",
-        {"q": q, "law": law, "limit": limit},
-    )
+    rows = cypher(Q_SEARCH_ARTICLES_FT, {"q": q, "law": law, "limit": limit})
     fallback_term = None
     if not rows:
         # 복합어(예: '대손세액공제')는 Lucene 토큰과 어긋나 빈 결과가 나올 수 있어
@@ -218,13 +587,7 @@ def t_search_articles(args: dict) -> str:
             candidates.append(raw[:4])
         for term in candidates:
             rows = cypher(
-                "MATCH (l:Law)-[:CONTAINS]->(a:Article) "
-                "WHERE l.is_current = true AND ($law IS NULL OR l.law_name CONTAINS $law) "
-                "AND (a.article_title CONTAINS $raw OR a.article_content CONTAINS $raw) "
-                "RETURN l.law_name AS law, l.enforcement_date AS enf, a.article_number AS no, "
-                "a.article_title AS title, substring(a.article_content, 0, 260) AS preview, 0 AS score "
-                "ORDER BY CASE WHEN a.article_title CONTAINS $raw THEN 0 ELSE 1 END "
-                "LIMIT $limit",
+                Q_SEARCH_ARTICLES_FALLBACK,
                 {"raw": term, "law": law, "limit": limit},
             )
             if rows:
@@ -239,49 +602,37 @@ def t_search_articles(args: dict) -> str:
         out.append(
             f"[{r['law']} {r['no']}] {r['title'] or ''} (시행 {fmt_date(r['enf'])})\n  {clip(r['preview'], 260)}"
         )
-    out.append("\n※ 원문 전체는 get_article로 조회.")
+    out.append("\n※ 원문 전체는 get_article로 조회. 삭제·비현행·비검증 CONTAINS는 제외.")
     return "\n\n".join(out)
 
 
 def t_get_article(args: dict) -> str:
     law = str(args["law_name"]).strip()
     no = norm_article_no(args["article_number"])
-    stmt = (
-        "MATCH (l:Law)-[:CONTAINS]->(a:Article) "
-        "WHERE {cond} AND l.is_current = true AND a.article_number = $no "
-        "RETURN l.law_name AS law, l.enforcement_date AS enf, a.article_id AS aid, "
-        "a.article_number AS no, a.article_title AS title, a.article_content AS content "
-        "LIMIT 1"
-    )
-    rows = cypher(stmt.format(cond="l.law_name = $law"), {"law": law, "no": no})
+    rows = cypher(q_current_article("l.law_name = $law"), {"law": law, "no": no})
     if not rows:  # 부분 법령명 허용 (예: '상속세' → '상속세 및 증여세법')
-        rows = cypher(stmt.format(cond="l.law_name CONTAINS $law"), {"law": law, "no": no})
+        rows = cypher(q_current_article("l.law_name CONTAINS $law"), {"law": law, "no": no})
     if not rows:
         return f"'{law} {no}' 조문을 찾지 못함. list_laws로 정확한 법령명을 확인하세요."
     r = rows[0]
-    deleg = cypher(
-        "MATCH (a:Article {article_id: $aid})-[:DELEGATES_TO]->(d:Article)<-[:CONTAINS]-(dl:Law) "
-        "WHERE dl.is_current = true "
-        "RETURN DISTINCT dl.law_name AS law, d.article_number AS no, d.article_title AS title LIMIT 10",
-        {"aid": r["aid"]},
-    )
+    deleg = cypher(Q_DELEGATES_TO, {"aid": r["aid"]})
+    parent = cypher(Q_DELEGATED_FROM, {"aid": r["aid"]})
     out = [
         f"# {r['law']} {r['no']} {r['title'] or ''}",
         f"(현행, 시행 {fmt_date(r['enf'])})",
         "",
         r["content"] or "",
     ]
+    if parent:
+        out.append("\n## 위임 상위법령 조문")
+        for d in parent:
+            out.append(f"- {d['law']} {d['no']} {d['title'] or ''}")
     if deleg:
         out.append("\n## 위임 하위법령 조문")
         for d in deleg:
             out.append(f"- {d['law']} {d['no']} {d['title'] or ''}")
 
-    annex = cypher(
-        "MATCH (a:Article {article_id: $aid})-[:HAS_ANNEX]->(x:Annex) "
-        "RETURN x.annex_number AS no, x.annex_title AS title, "
-        "size(coalesce(x.content, '')) AS len ORDER BY x.annex_number",
-        {"aid": r["aid"]},
-    )
+    annex = cypher(Q_ARTICLE_ANNEX, {"aid": r["aid"]})
     if annex:
         # 세율표·기준금액이 별표에 있으면 조문만 읽어서는 숫자가 안 나온다
         out.append("\n## 이 조문이 위임한 별표")
@@ -292,7 +643,7 @@ def t_get_article(args: dict) -> str:
     upcoming = cypher(
         "MATCH (a:Article {article_id: $aid})-[:HAS_UPCOMING]->(u:UpcomingArticle) "
         "RETURN u.enforcement_date AS d, u.change_type AS kind, u.content AS content "
-        "ORDER BY d",
+        "ORDER BY d LIMIT 20",
         {"aid": r["aid"]},
     )
     if upcoming:
@@ -304,28 +655,30 @@ def t_get_article(args: dict) -> str:
         out.append("\n※ 시행예정 조문은 공포됐으나 아직 시행 전이다. 과세기간·거래일이 "
                    "시행일 전이면 위 현행 조문이 적용된다.")
 
+    cites = cypher(Q_VERIFIED_CITATIONS, {"aid": r["aid"], "limit": CITATION_LIMIT})
+    if cites:
+        out.append("\n## 검증된 인용 (각 최대 5건 · 인용≠적용)")
+        labels = {"case": "판례", "interpretation": "해석례", "ruling": "예규"}
+        for c in cites:
+            kind = labels.get(c.get("kind"), c.get("kind") or "문서")
+            out.append(
+                f"- [{kind}] {c.get('org') or ''} {c.get('no') or ''} "
+                f"({fmt_date(c.get('d'))}) · {fmt_uncertainty(c.get('tr'), c.get('vid'))}"
+            )
+
+    snap = r.get("article_snap") or r.get("law_snap") or ""
     out.append(f"\n출처: {r['law']} {r['no']} (시행 {fmt_date(r['enf'])} 기준)")
+    if snap:
+        out.append(f"원천 스냅샷: {snap}")
+    out.append(PROVENANCE_FOOTER)
     return "\n".join(out)
 
 
 def t_get_article_history(args: dict) -> str:
     law = str(args["law_name"]).strip()
     no = norm_article_no(args["article_number"])
-    rows = cypher(
-        "MATCH (l:Law)-[:CONTAINS]->(a:Article) "
-        "WHERE l.law_name CONTAINS $law AND a.article_number = $no "
-        "WITH DISTINCT a LIMIT 1 "
-        "MATCH (a)-[:HAS_VERSION]->(v:ArticleVersion) "
-        "RETURN v.enforcement_date AS enf, v.valid_from AS vfrom "
-        "ORDER BY v.valid_from DESC LIMIT 20",
-        {"law": law, "no": no},
-    )
-    cur = cypher(
-        "MATCH (l:Law)-[:CONTAINS]->(a:Article) "
-        "WHERE l.law_name CONTAINS $law AND l.is_current = true AND a.article_number = $no "
-        "RETURN a.article_content AS content LIMIT 1",
-        {"law": law, "no": no},
-    )
+    rows = cypher(Q_ARTICLE_HISTORY, {"law": law, "no": no})
+    cur = cypher(Q_CURRENT_ARTICLE_MARKS, {"law": law, "no": no})
     out = [f"# {law} {no} 개정 연혁"]
     if cur:
         marks = re.findall(r"<개정[^>]*>|<신설[^>]*>|\[전문개정[^\]]*\]", cur[0].get("content") or "")
@@ -334,10 +687,24 @@ def t_get_article_history(args: dict) -> str:
     if rows:
         out.append("\n조문 버전 이력 (최근순):")
         for r in rows:
-            out.append(f"- 시행 {fmt_date(r['enf'])} (적용 시점 {fmt_date(r['vfrom'])})")
+            verified = bool(r.get("verified"))
+            snap = (r.get("snap") or "").strip()
+            flag = "검증·원천있음" if verified and snap else (
+                "검증됨·원천없음" if verified else "미검증 — 적용 단정 금지"
+            )
+            span = fmt_date(r["vfrom"])
+            if r.get("vto"):
+                span += f"~{fmt_date(r['vto'])}"
+            out.append(
+                f"- 시행 {fmt_date(r['enf'])} (적용 구간 {span}) · {flag}"
+            )
     if len(out) == 1:
         return f"'{law} {no}'의 연혁 정보를 찾지 못함."
-    out.append("\n※ 버전 이력은 수집 시점에 따라 일부 누락 가능. 확정 판단은 law.go.kr 연혁 대조 요망.")
+    out.append(
+        "\n※ 미검증이거나 원천 스냅샷이 없는 버전은 출처 확인된 연혁이 아니다. "
+        "resolved_version_id 없는 인용을 이 이력의 현행 조문에 적용했다고 보지 말 것. "
+        "확정 판단은 law.go.kr 연혁 대조 요망."
+    )
     return "\n".join(out)
 
 
@@ -359,7 +726,10 @@ def t_search_cases(args: dict) -> str:
         out.append(
             f"[{r['court'] or '판례'}] {r['no']} {r['name'] or ''} ({fmt_date(r['d'])})\n  {clip(r['preview'], 320)}"
         )
-    out.append("\n※ 요지 발췌임. 인용 시 사건번호로 원문 확인 요망.")
+    out.append(
+        "\n※ 요지 발췌임. 키워드 검색은 본문 일치이며 현행 조문에 대한 검증된 인용이 아니다. "
+        "조문 연결은 get_article의 검증된 인용만 쓴다. 인용 시 사건번호로 원문 확인 요망."
+    )
     return "\n\n".join(out)
 
 
@@ -379,7 +749,10 @@ def t_search_interpretations(args: dict) -> str:
     for r in rows:
         head = " ".join(x for x in [r.get("org"), r.get("no"), f"({fmt_date(r.get('d'))})" if r.get("d") else ""] if x)
         out.append(f"[{head}] {r['title'] or ''}\n  {clip(r['preview'], 320)}")
-    out.append("\n※ 해석례는 개별 사실관계 전제임. 문서번호로 원문 확인 요망.")
+    out.append(
+        "\n※ 해석례는 개별 사실관계 전제임. 키워드 검색은 본문 일치이며 "
+        "현행 조문에 대한 검증된 인용이 아니다. 문서번호로 원문 확인 요망."
+    )
     return "\n\n".join(out)
 
 
@@ -390,15 +763,7 @@ def t_search_annexes(args: dict) -> str:
     q = lucene_escape(str(args["query"]))
     law = args.get("law_name")
     limit = min(int(args.get("limit", 5)), 15)
-    rows = cypher(
-        "CALL db.index.fulltext.queryNodes('annex_content_ft', $q) YIELD node, score "
-        "WHERE ($law IS NULL OR node.law_name CONTAINS $law) "
-        "RETURN node.law_name AS law, node.annex_number AS no, node.annex_title AS title, "
-        "node.annex_type AS kind, size(coalesce(node.content, '')) AS len, "
-        "substring(coalesce(node.content, ''), 0, 240) AS preview, score "
-        "ORDER BY score DESC LIMIT $limit",
-        {"q": q, "law": law, "limit": limit},
-    )
+    rows = cypher(Q_SEARCH_ANNEXES, {"q": q, "law": law, "limit": limit})
     if not rows:
         return (
             "검색 결과 없음. 별표는 세율표·기준금액·분류표가 많다 — "
@@ -418,20 +783,9 @@ def t_get_annex(args: dict) -> str:
     no = str(args["annex_number"]).strip()
     if not re.match(r"^(별표|서식)", no):
         no = f"별표 {no.lstrip('제').rstrip('호')}".strip()
-    rows = cypher(
-        "MATCH (x:Annex) WHERE x.law_name CONTAINS $law "
-        "AND replace(x.annex_number, ' ', '') = replace($no, ' ', '') "
-        "RETURN x.law_name AS law, x.annex_number AS no, x.annex_title AS title, "
-        "x.content AS content, x.hwp_url AS hwp, x.pdf_url AS pdf, "
-        "x.related_articles AS arts LIMIT 1",
-        {"law": law, "no": no},
-    )
+    rows = cypher(Q_GET_ANNEX, {"law": law, "no": no})
     if not rows:
-        near = cypher(
-            "MATCH (x:Annex) WHERE x.law_name CONTAINS $law "
-            "RETURN x.annex_number AS no, x.annex_title AS t ORDER BY x.annex_number LIMIT 40",
-            {"law": law},
-        )
+        near = cypher(Q_GET_ANNEX_NEAR, {"law": law})
         if near:
             listing = "\n".join(f"- [{r['no']}] {r['t']}" for r in near)
             return f"'{law} {no}'를 찾지 못함. 수록 별표·서식:\n{listing}"
@@ -735,7 +1089,7 @@ def t_get_treaty_article(args: dict) -> str:
 TOOLS = [
     {
         "name": "list_laws",
-        "description": "이 DB에 수록된 현행 세법 법령 목록(법률·시행령·시행규칙)과 시행일을 반환한다. 다른 도구를 쓰기 전 수록 범위 확인용.",
+        "description": "이 DB에 수록된 현행 세법 법령 목록(법률·시행령·시행규칙)과 시행일을 반환한다. 국세청 조세법령 목록의 현행만 포함하며 목록 역사 법령은 제외. 다른 도구를 쓰기 전 수록 범위 확인용.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "fn": t_list_laws,
     },
@@ -756,7 +1110,7 @@ TOOLS = [
     },
     {
         "name": "get_article",
-        "description": "특정 조문의 현행 원문 전체를 반환한다 (시행일·위임 하위법령 조문 포함). 세율·한도·요건 등 정확한 수치는 반드시 이 도구로 원문을 확인할 것.",
+        "description": "특정 조문의 현행 원문 전체를 반환한다 (시행일·검증된 위임 상·하위법령·별표·검증된 인용 포함). 세율·한도·요건 등 정확한 수치는 반드시 이 도구로 원문을 확인할 것. 인용은 적용 확정이 아니다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -770,7 +1124,7 @@ TOOLS = [
     },
     {
         "name": "get_article_history",
-        "description": "특정 조문의 개정 연혁(버전 이력, 개정 표기)을 반환한다. '언제 바뀌었나' 질문에 사용.",
+        "description": "특정 조문의 개정 연혁(버전 이력, 개정 표기, 검증·원천 여부)을 반환한다. '언제 바뀌었나' 질문에 사용. 미검증 버전은 적용 단정에 쓰지 말 것.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -784,7 +1138,7 @@ TOOLS = [
     },
     {
         "name": "search_cases",
-        "description": "판례·조세심판원 결정례를 전문검색한다 (대법원·고등법원 판례, 조세심판원 심판례 15만+건). 단일 핵심 키워드가 정확함.",
+        "description": "판례·조세심판원 결정례를 전문검색한다 (대법원·고등법원 판례, 조세심판원 심판례). 단일 핵심 키워드가 정확함. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -798,7 +1152,7 @@ TOOLS = [
     },
     {
         "name": "search_interpretations",
-        "description": "국세청 질의회신·법제처 해석례를 전문검색한다 (14만+건). 실무 쟁점의 과세관청 입장 확인에 사용.",
+        "description": "국세청 질의회신·법제처·행정안전부 해석례를 전문검색한다. 실무 쟁점의 과세관청 입장 확인에 사용. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1100,7 +1454,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path.rstrip("/")
         if path in ("", "/healthz"):
             try:
-                n = cypher("MATCH (l:Law) WHERE l.is_current RETURN count(l) AS n")[0]["n"]
+                n = cypher(
+                    "MATCH (l:Law) WHERE " + current_law_guard(law="l") + " RETURN count(l) AS n"
+                )[0]["n"]
                 self.send_json({"status": "ok", "server": SERVER_NAME, "current_laws": n})
             except Exception:
                 self.send_json({"status": "degraded", "server": SERVER_NAME}, 503)

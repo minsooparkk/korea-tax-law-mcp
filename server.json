@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.minsooparkk/korea-tax-law-mcp",
-  "description": "Korean tax law graph: national + local tax statutes, 150k+ court/tribunal cases, 145k+ NTS rulings, and tax treaties with 107 countries.",
+  "description": "Korean tax law graph: NTS catalogue 90 current tax statutes (2 historical excluded), 150k+ court/tribunal cases, 145k+ interpretations, and tax treaties. Traversal uses active verified source-backed edges only.",
   "repository": {
     "url": "https://github.com/minsooparkk/korea-tax-law-mcp",
     "source": "github"
   },
-  "version": "0.6.0",
+  "version": "0.7.0",
   "websiteUrl": "https://github.com/minsooparkk/korea-tax-law-mcp",
   "remotes": [
     {
