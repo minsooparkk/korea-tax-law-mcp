@@ -18,10 +18,17 @@ https://mcp.taxdoctorai.com/mcp
 
 ## 도구
 
-현재 버전 **v0.7.0** ([CHANGELOG](CHANGELOG.md))
+현재 버전 **v0.8.0** ([CHANGELOG](CHANGELOG.md))
+
+`search_tax`는 로컬 tax-ai-agent의 `GraphSearcher.search_for_query`와 같은 코드를
+사용합니다. 법률→시행령→시행규칙과 연결 문서를 탐색하고, 각 결과에 실제 노드·관계
+경로, DB 원문, 적용 시점 및 미확정 상태를 반환합니다. 런타임은 Python 3.11+이며
+`server.py`와 `src/` 공통 검색 코드 번들을 함께 실행합니다.
 
 | 도구 | 용도 |
 |---|---|
+| `search_tax` | 로컬과 동일한 통합 탐색, 결과별 실제 경로·원문·적용 시점, `as_of` 별도 조문 버전 조회 |
+| `get_evidence` | 검색된 자료의 원문 이어읽기, 원문 전문·요지·미수록 구분 |
 | `list_laws` | 수록 현행 법령 목록 + 시행일 (국세·지방세 구분). 목록 역사 법령 제외 |
 | `search_articles` | 조문 전문검색 (복합어 부분일치 폴백 포함). 현행·검증 CONTAINS만 |
 | `get_article` | 조문 현행 원문 전체 + 시행일 + 검증된 위임·별표·인용 |
@@ -36,6 +43,17 @@ https://mcp.taxdoctorai.com/mcp
 | `get_treaty_article` | 조세조약 조문 원문 (국문 + 영문) + 그 조문을 개정한 의정서 |
 
 ## 연결 방법
+
+통합 검색 예시:
+
+```json
+{"search_intents":{"law":["소득세법 제97조의2"],"ruling":["배우자 증여 이월과세"]},"as_of":"2023-01-01","limit":10}
+```
+
+`search_tax`의 `next_offset`으로 다음 결과를 조회합니다. `original_text.continuation`은
+긴 원문을 이어 읽는 `get_evidence` 호출 인자입니다. 검색 집합은 로컬 검색기의 수집
+상한을 따르며 전체 DB 건수는 아닙니다. `as_of_lookup`은 현행 그래프와 별도로 조회한
+당시 조문입니다. 인용 문서의 적용 버전이 미해소이면 현행 적용으로 단정하지 않습니다.
 
 **Claude** (웹/데스크톱): 설정 → Connectors → Add custom connector → `https://mcp.taxdoctorai.com/mcp`
 
@@ -233,10 +251,12 @@ law.go.kr 원문을 반드시 대조하세요.
 
 ## 직접 호스팅
 
-`server.py` 하나가 전부입니다. 파이썬 3.9+ 표준 라이브러리만 사용 (의존성 0).
+`server.py`와 동봉된 `src/` 공통 검색 모듈을 함께 실행합니다. Python 3.11+ 표준
+라이브러리만 사용하며 외부 런타임 의존성은 없습니다. `bundle-manifest.json`은
+배포된 공통 소스의 해시를 기록합니다.
 
 ```bash
-NEO4J_HTTP=http://127.0.0.1:7474 NEO4J_USER=neo4j NEO4J_PASSWORD=... PORT=8788 python3 server.py
+NEO4J_HTTP=http://127.0.0.1:7474 NEO4J_USER=neo4j NEO4J_PASSWORD=... PORT=8788 python3.11 server.py
 ```
 
 단, 같은 스키마의 Neo4j 그래프 DB가 필요합니다 (Law/Article/Case/Interpretation/Treaty/TreatyArticle 노드, 풀텍스트 인덱스, 관계의 `active`/`verified`/원천 스냅샷). 데이터 수집 파이프라인과 DB 덤프는 이 리포에 포함되어 있지 않으므로, 일반 사용자는 호스팅 엔드포인트 사용을 권장합니다.

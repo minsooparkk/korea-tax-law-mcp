@@ -4,7 +4,7 @@
 한국 세법 법령·판례·심판례·해석례·조세조약 그래프 DB(Neo4j)를 MCP 도구로 노출한다.
 - 수록 범위: 국세 + 지방세 현행 법령(법·령·칙), 판례·조세심판원 결정례,
   국세청·법제처·행정안전부 해석례, 조세조약(체결국별 협약·의정서 조문)
-- 의존성 없음: 파이썬 표준 라이브러리만 사용 (3.9+)
+- 의존성 없음: 공유 검색 모듈 + 파이썬 표준 라이브러리만 사용 (3.11+)
 - Neo4j 접근: HTTP Query API v2 (읽기 전용 파라미터 쿼리만, raw cypher 노출 없음)
 - 방어: IP당 분당 호출 제한, 전역 동시 쿼리 제한, 쿼리 타임아웃
 - 로그: logs/mcp/usage-YYYYMMDD.jsonl
@@ -23,25 +23,31 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from urllib.parse import parse_qs, urlparse
 from collections import defaultdict, deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
+from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPT_DIR)
+if os.path.isdir(os.path.join(REPO, "src")):
+    sys.path.insert(0, REPO)
+
+from src.search.public_search import BODY_FIELDS, INTENT_TYPES, NODE_TYPES, PublicGraphSearch
+
 LOG_DIR = os.environ.get("MCP_LOG_DIR") or os.path.join(REPO, "logs", "mcp")
 BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -60,6 +66,11 @@ NEO4J_TIMEOUT = 8          # 쿼리 타임아웃(초)
 MAX_BODY = 64 * 1024       # 요청 본문 한도
 
 INSTRUCTIONS = (
+    "쟁점별 자료 수집은 search_tax를 우선 사용하세요. 로컬 tax-ai-agent와 같은 통합 검색기로 "
+    "법률→시행령→시행규칙과 인용 문서·참조 조문·통칙·별표를 탐색하고, 결과별 실제 경로·원문·시점을 반환합니다. "
+    "search_intents에 law/case/ruling/tribunal/treaty/annex 배열을 지정하세요. "
+    "next_page가 있으면 그 인자로 다음 결과를 조회하고, original_text.continuation이 있으면 get_evidence로 원문을 이어 읽으세요. "
+    "as_of는 별도 조문 버전 조회이며 현행 그래프의 인용을 과거 적용으로 확정하지 않습니다. "
     "한국 세법 법령 그래프 DB입니다. 국세청 조세법령 목록의 현행 법·령·칙, 판례, "
     "조세심판원 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
     "조문은 '현행 시행 버전' 기준이며 각 결과에 시행일이 표기됩니다. "
@@ -109,6 +120,10 @@ class BusyError(Exception):
     pass
 
 
+class DatabaseQueryError(Exception):
+    pass
+
+
 def cypher(statement: str, parameters: dict | None = None) -> list[dict]:
     """읽기 전용 파라미터 쿼리 실행. 결과를 dict 행 목록으로 반환."""
     if not _query_slots.acquire(timeout=2):
@@ -127,6 +142,8 @@ def cypher(statement: str, parameters: dict | None = None) -> list[dict]:
         )
         with urllib.request.urlopen(req, timeout=NEO4J_TIMEOUT) as r:
             data = json.loads(r.read().decode())
+        if data.get("errors"):
+            raise DatabaseQueryError("Neo4j query failed")
         d = data.get("data", {})
         fields, values = d.get("fields", []), d.get("values", [])
         return [dict(zip(fields, row)) for row in values]
@@ -553,8 +570,8 @@ def t_list_laws(args: dict) -> str:
     for r in rows:
         counts[kind(r["name"], r["ministry"])] += 1
     lines = [
-        f"수록 현행 법령 {len(rows)}건 "
-        f"(국세 {counts['국세']} · 지방세 {counts['지방세']} · 국세/지방세 공통 {counts['공통']}):"
+        (f"수록 현행 법령 {len(rows)}건 "
+         f"(국세 {counts['국세']} · 지방세 {counts['지방세']} · 국세/지방세 공통 {counts['공통']}):")
     ]
     for r in rows:
         k = kind(r["name"], r["ministry"])
@@ -1086,6 +1103,14 @@ def t_get_treaty_article(args: dict) -> str:
     return "\n".join(out)
 
 
+def t_search_tax(args: dict) -> dict:
+    return PublicGraphSearch(cypher).search(args)
+
+
+def t_get_evidence(args: dict) -> dict:
+    return PublicGraphSearch(cypher).get_evidence(args)
+
+
 TOOLS = [
     {
         "name": "list_laws",
@@ -1247,6 +1272,49 @@ TOOLS = [
         "fn": t_get_treaty_article,
     },
 ]
+TOOLS.extend([
+    {
+        "name": "search_tax",
+        "description": "로컬 tax-ai-agent와 같은 통합 그래프 탐색. law 시작 조문에서 위임을 최대 2단계 따라 판례·예규·해석례·참조조문·통칙·부칙 적용근거·별표를 모으고 전문검색으로 보충한다. 결과마다 실제 graph_paths, DB 원문, 시행일·적용버전·미확정 상태를 반환한다. 쟁점 자료 수집의 우선 도구. next_offset으로 결과를, get_evidence로 긴 원문을 이어 읽을 것.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search_intents": {
+                    "type": "object", "minProperties": 1, "additionalProperties": False,
+                    "description": "유형별 검색 의도. 전체 1~8개. 예: {law:[소득세법 제97조의2],case:[이월과세],ruling:[배우자 증여]}",
+                    "properties": {name: {"type": "array", "maxItems": 3,
+                                          "items": {"type": "string", "minLength": 1, "maxLength": 300}}
+                                   for name in INTENT_TYPES},
+                },
+                "as_of": {"type": "string", "description": "선택: YYYY-MM-DD 또는 YYYYMMDD. 조문별 당시 버전을 별도 반환하며 불명 시 현행으로 대체하지 않음."},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10},
+                "result_set_id": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "다음 페이지는 이전 응답의 식별자를 전달하여 검색 집합 변경을 감지"},
+            },
+            "required": ["search_intents"], "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object", "required": ["schema_version", "results", "total_results", "notice"]},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        "fn": t_search_tax,
+    },
+    {
+        "name": "get_evidence",
+        "description": "search_tax가 찾은 근거의 DB 원문을 읽는다. 판례·해석례·예규·조문·통칙·별표·부칙·조약·역사버전을 지원. 긴 본문은 next_offset까지 반복하면 누락 없이 읽을 수 있다. summary_only는 원문 전문이 없는 요지임. 적용 시점 미해소를 현행으로 보충하지 말 것.",
+        "inputSchema": {
+            "type": "object", "properties": {
+                "evidence_type": {"type": "string", "enum": list(NODE_TYPES)},
+                "evidence_id": {"type": "string", "minLength": 1, "maxLength": 500},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 10000000, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 24000, "default": 12000},
+                "source_field": {"type": "string", "enum": sorted({f for fields in BODY_FIELDS.values() for f in fields}),
+                                 "description": "선택: original_text.available_fields의 다른 원문 필드 조회"},
+            }, "required": ["evidence_type", "evidence_id"], "additionalProperties": False,
+        },
+        "outputSchema": {"type": "object", "required": ["found", "evidence_type", "evidence_id"]},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        "fn": t_get_evidence,
+    },
+])
 TOOL_MAP = {t["name"]: t for t in TOOLS}
 
 # ---------------------------------------------------------------- rate limit / 로그
@@ -1288,10 +1356,10 @@ def log_usage(ip: str, method: str, tool: str, ms: int, status: str):
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         rec = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
+            "ts": datetime.now().isoformat(timespec="seconds"),  # noqa: DTZ005 - Preserve local log timestamps.
             "ip": ip, "method": method, "tool": tool, "ms": ms, "status": status,
         }
-        path = os.path.join(LOG_DIR, f"usage-{datetime.now():%Y%m%d}.jsonl")
+        path = os.path.join(LOG_DIR, f"usage-{datetime.now():%Y%m%d}.jsonl")  # noqa: DTZ005 - Local daily buckets.
         with _log_lock, open(path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
@@ -1337,7 +1405,7 @@ def handle_message(msg: dict, ip: str):
         return {"jsonrpc": "2.0", "id": id_, "result": {}}
 
     if method == "tools/list":
-        tools = [{k: t[k] for k in ("name", "description", "inputSchema")} for t in TOOLS]
+        tools = [{k: t[k] for k in ("name", "description", "inputSchema", "outputSchema", "annotations") if k in t} for t in TOOLS]
         log_usage(ip, "tools/list", "", 0, "ok")
         return {"jsonrpc": "2.0", "id": id_, "result": {"tools": tools}}
 
@@ -1355,21 +1423,30 @@ def handle_message(msg: dict, ip: str):
                            "text": "호출 한도 초과(분당 30회). 잠시 후 다시 시도해 주세요."}],
                            "isError": True},
             }
+        output = None
         try:
-            text = tool["fn"](params.get("arguments") or {})
+            output = tool["fn"](params.get("arguments") or {})
+            text = json.dumps(output, ensure_ascii=False) if isinstance(output, dict) else output
             status, is_err = "ok", False
         except BusyError as e:
             text, status, is_err = str(e), "busy", True
         except KeyError as e:
             text, status, is_err = f"필수 인자 누락: {e}", "bad_args", True
+        except ValueError as e:
+            text, status, is_err = str(e), "bad_args", True
+        except TimeoutError:
+            text, status, is_err = "통합 검색 시간·조회 한도 초과. 검색 의도를 좁혀 다시 호출하세요.", "timeout", True
         except urllib.error.URLError:
             text, status, is_err = "DB 연결 실패. 잠시 후 다시 시도해 주세요.", "db_down", True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - Serialize unexpected tool errors at the MCP boundary.
             text, status, is_err = f"조회 실패: {type(e).__name__}", "error", True
         log_usage(ip, "tools/call", name, int((time.time() - t0) * 1000), status)
+        result = {"content": [{"type": "text", "text": text}], "isError": is_err}
+        if isinstance(output, dict) and not is_err:
+            result["structuredContent"] = output
         return {
             "jsonrpc": "2.0", "id": id_,
-            "result": {"content": [{"type": "text", "text": text}], "isError": is_err},
+            "result": result,
         }
 
     return rpc_error(id_, -32601, f"지원하지 않는 메서드: {method}")
@@ -1458,7 +1535,7 @@ class Handler(BaseHTTPRequestHandler):
                     "MATCH (l:Law) WHERE " + current_law_guard(law="l") + " RETURN count(l) AS n"
                 )[0]["n"]
                 self.send_json({"status": "ok", "server": SERVER_NAME, "current_laws": n})
-            except Exception:
+            except Exception:  # noqa: BLE001 - Health must report degradation for all DB failures.
                 self.send_json({"status": "degraded", "server": SERVER_NAME}, 503)
             return
         if path == "/sse":
@@ -1499,7 +1576,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(rpc_error(None, -32600, "요청이 너무 큽니다"), 400)
                 return None
             msg = json.loads(self.rfile.read(length).decode())
-        except Exception:
+        except (ValueError, UnicodeError, OSError):
             self.send_json(rpc_error(None, -32700, "JSON 파싱 실패"), 400)
             return None
         if isinstance(msg, list):

@@ -1,0 +1,48 @@
+{
+  "schema": "tax-public-mcp-bundle-v1",
+  "source_revision": "db67fb513ce23e820967941f432f985524ca73ca",
+  "source_dirty": true,
+  "files": {
+    "server.py": {
+      "sha256": "69d27fdae95fd328c42e4138d9f372867150ea722dbf163fa59fa02e8d0effa8",
+      "source": "mcp/server.py"
+    },
+    "src/__init__.py": {
+      "sha256": "4d63bd274a1529c933f3500c2a9f747951e8bbdd5cdfa9ff3f948905944e2ab0",
+      "source": "generated"
+    },
+    "src/pipeline/__init__.py": {
+      "sha256": "4721c3254b3f7899ca2bf53b3b31005da5c16b0bde23c7664de69ede2ca92e06",
+      "source": "generated"
+    },
+    "src/pipeline/document_projection.py": {
+      "sha256": "4e57938528c5f17c74ce30a394a72102bca2b0125142a1a33483baf78325a267",
+      "source": "src/pipeline/document_projection.py"
+    },
+    "src/search/__init__.py": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "source": "src/search/__init__.py"
+    },
+    "src/search/cypher_templates.py": {
+      "sha256": "eb661307ff666ea4b21cc25d302e1037fb73abbd84b1b5a95fb2be9578763bf0",
+      "source": "src/search/cypher_templates.py"
+    },
+    "src/search/edge_provenance.py": {
+      "sha256": "df4aabfe97720cb7d0fcefe600dbb993dd4c3618904682e0f92d2cd0a0cb70b6",
+      "source": "src/search/edge_provenance.py"
+    },
+    "src/search/evidence_identity.py": {
+      "sha256": "643cf8e9b038ddd9db190252e9b1c12ed851922497a3ac403279a85189567141",
+      "source": "src/search/evidence_identity.py"
+    },
+    "src/search/graph_searcher.py": {
+      "sha256": "671277bc7ad97c1e58a26c435054ed8b371c23a5ffdf05815b6c443c843ce244",
+      "source": "src/search/graph_searcher.py"
+    },
+    "src/search/public_search.py": {
+      "sha256": "46b637c9b3de72e13e1881bac33a12d64d5e301c72517af441f2f2630daed803",
+      "source": "src/search/public_search.py"
+    }
+  },
+  "payload_sha256": "28fbafa5a976b7e749a674c861e0b3938c12134c14f79080acb8d0bb30e007ab"
+}
