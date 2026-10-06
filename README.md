@@ -18,7 +18,7 @@ https://mcp.taxdoctorai.com/mcp
 
 ## 도구
 
-현재 버전 **v0.8.0** ([CHANGELOG](CHANGELOG.md))
+현재 버전 **v0.8.1** ([CHANGELOG](CHANGELOG.md))
 
 `search_tax`는 로컬 tax-ai-agent의 `GraphSearcher.search_for_query`와 같은 코드를
 사용합니다. 법률→시행령→시행규칙과 연결 문서를 탐색하고, 각 결과에 실제 노드·관계
@@ -33,7 +33,7 @@ https://mcp.taxdoctorai.com/mcp
 | `search_articles` | 조문 전문검색 (복합어 부분일치 폴백 포함). 현행·검증 CONTAINS만 |
 | `get_article` | 조문 현행 원문 전체 + 시행일 + 검증된 위임·별표·인용 |
 | `get_article_history` | 조문 개정 연혁 ("언제 바뀌었나"). 미검증 버전 표시 |
-| `search_cases` | 판례·조세심판원 결정례 키워드 검색 (검증된 인용 아님) |
+| `search_cases` | 판례·조세심판원 결정례·국세청 심사·이의·적부 결정례 키워드 검색 (검증된 인용 아님) |
 | `search_interpretations` | 국세청·법제처·행정안전부 해석례 키워드 검색 (검증된 인용 아님) |
 | `search_annexes` | 별표·서식 검색 (세율표·기준금액·분류표) |
 | `get_annex` | 별표 본문 전체 + 원본 HWP·PDF 링크 |
@@ -163,11 +163,12 @@ url = "https://mcp.taxdoctorai.com/mcp"
 섞으면 어느 쪽을 답한 것인지 알 수 없게 됩니다.
 `get_article`은 그 조문에 시행예정 개정이 있으면 시행일과 함께 경고합니다.
 
-### 판례·결정례 — 153,028건
+### 판례·결정례 — 177,504건
 
 | 구분 | 건수 |
 |---|---|
 | 조세심판원 결정례 | 139,504 |
+| 국세청 심사·이의·적부 결정례 | 24,476 (2026-10 추가) |
 | 대법원 판례 | 8,949 |
 | 고등법원 판례 | 3,676 |
 | 헌법재판소 결정 | 899 |
@@ -201,6 +202,7 @@ url = "https://mcp.taxdoctorai.com/mcp"
 | 대법원·고등법원 판례 | 국가법령정보센터 | `law.go.kr/판례/{id}` |
 | 헌법재판소 결정 | 국가법령정보센터 | `target=detc` |
 | 조세심판원 결정례 | 국가법령정보센터 | `target=ttSpecialDecc` |
+| 국세청 심사·이의·적부 결정례 | 국세법령정보시스템 | `taxlaw.nts.go.kr` 공개 조회 액션 |
 | 국세청 질의회신 목록 | 공공데이터포털 | [법제처_국세청 법령해석 목록](https://www.data.go.kr/data/15140313/openapi.do) |
 | 국세청 질의회신 본문 | 국세법령정보시스템 | `taxlaw.nts.go.kr` 공개 조회 액션 |
 | 법제처 법령해석례 | 국가법령정보센터 | `law.go.kr/법령해석례/{id}` |

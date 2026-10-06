@@ -309,20 +309,24 @@ rel.similarity_score AS similarity_score,
 """
 
 # ============================================================
-# 8. 조세심판원 결정례 전용 탐색
+# 8. 불복 결정례(조세심판원 심판·국세청 심사·이의·적부) 전용 탐색
 # ============================================================
 
-# 조문 → 심판례 (court_type = '조세심판원'인 Case만 필터)
+# 법원 판결이 아닌 불복 결정 — 국세청 결정례는 scripts/collect_nts_decisions.py 가 court_type "국세청"으로 넣는다
+DECISION_COURT_TYPES = ("조세심판원", "국세청")
+_DECISION_TYPES = "[" + ", ".join(f"'{name}'" for name in DECISION_COURT_TYPES) + "]"
+
+# 조문 → 결정례 (court_type 이 불복 결정 기관인 Case만 필터)
 TRAVERSE_HAS_TRIBUNAL = f"""
 MATCH (a:Article {{article_id: $article_id}})-[rel:HAS_CASE]->(c:Case)
 WHERE {_DOC_CASE}
   AND {_CURRENT_A}
-  AND c.court_type = '조세심판원'
+  AND c.court_type IN {_DECISION_TYPES}
 RETURN c {{
     _content_snapshot: c.source_snapshot,
     .case_id, .case_number, .case_name, .court_name, .court_type,
     .ruling_date, .ruling_type, .case_holding, .ruling_summary,
-    .full_content, .case_url
+    .full_content, .case_url, .decision_result
 }} AS tribunal,
 rel.relevance_score AS relevance_score,
 '조세심판례' AS edge_type,
@@ -339,16 +343,17 @@ rel.resolved_version_id AS resolved_version_id
 ORDER BY c.ruling_date DESC
 """
 
-# 조세심판례 전문검색 (case_content_ft 인덱스 활용, court_type 필터)
-FULLTEXT_SEARCH_TRIBUNALS = """
+# 결정례 전문검색 (case_content_ft 인덱스 활용, court_type 필터)
+FULLTEXT_SEARCH_TRIBUNALS = f"""
 CALL db.index.fulltext.queryNodes('case_content_ft', $query)
 YIELD node, score
-WHERE score > $min_score AND node.court_type = '조세심판원'
-RETURN node {
+WHERE score > $min_score AND node.court_type IN {_DECISION_TYPES}
+RETURN node {{
     _content_snapshot: node.source_snapshot,
     .case_id, .case_number, .case_name, .court_name, .court_type,
-    .ruling_date, .ruling_type, .case_holding, .ruling_summary, .case_url
-} AS tribunal, score
+    .ruling_date, .ruling_type, .case_holding, .ruling_summary, .full_content,
+    .case_url, .decision_result
+}} AS tribunal, score
 ORDER BY score DESC
 LIMIT $limit
 """
@@ -772,7 +777,7 @@ WHERE score > $min_score
 RETURN node {
     _content_snapshot: node.source_snapshot,
     .case_id, .case_number, .case_name, .court_name, .court_type,
-    .ruling_date, .case_holding, .ruling_summary
+    .ruling_date, .case_holding, .ruling_summary, .full_content, .decision_result
 } AS case_data, score
 ORDER BY score DESC
 LIMIT $limit

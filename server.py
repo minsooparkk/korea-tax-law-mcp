@@ -2,7 +2,7 @@
 """세법 그래프 MCP 서버 — 공개용 read-only Streamable HTTP (stateless).
 
 한국 세법 법령·판례·심판례·해석례·조세조약 그래프 DB(Neo4j)를 MCP 도구로 노출한다.
-- 수록 범위: 국세 + 지방세 현행 법령(법·령·칙), 판례·조세심판원 결정례,
+- 수록 범위: 국세 + 지방세 현행 법령(법·령·칙), 판례·조세심판원 결정례·국세청 심사·이의·적부 결정례,
   국세청·법제처·행정안전부 해석례, 조세조약(체결국별 협약·의정서 조문)
 - 의존성 없음: 공유 검색 모듈 + 파이썬 표준 라이브러리만 사용 (3.11+)
 - Neo4j 접근: HTTP Query API v2 (읽기 전용 파라미터 쿼리만, raw cypher 노출 없음)
@@ -47,7 +47,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.8.1"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -68,11 +68,11 @@ MAX_BODY = 64 * 1024       # 요청 본문 한도
 INSTRUCTIONS = (
     "쟁점별 자료 수집은 search_tax를 우선 사용하세요. 로컬 tax-ai-agent와 같은 통합 검색기로 "
     "법률→시행령→시행규칙과 인용 문서·참조 조문·통칙·별표를 탐색하고, 결과별 실제 경로·원문·시점을 반환합니다. "
-    "search_intents에 law/case/ruling/tribunal/treaty/annex 배열을 지정하세요. "
+    "search_intents에 law/case/ruling/tribunal/treaty/annex 배열을 지정하세요(tribunal은 조세심판원·국세청 불복 결정례). "
     "next_page가 있으면 그 인자로 다음 결과를 조회하고, original_text.continuation이 있으면 get_evidence로 원문을 이어 읽으세요. "
     "as_of는 별도 조문 버전 조회이며 현행 그래프의 인용을 과거 적용으로 확정하지 않습니다. "
     "한국 세법 법령 그래프 DB입니다. 국세청 조세법령 목록의 현행 법·령·칙, 판례, "
-    "조세심판원 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
+    "조세심판원 결정례, 국세청 심사·이의·적부 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
     "조문은 '현행 시행 버전' 기준이며 각 결과에 시행일이 표기됩니다. "
     "위임·별표·문서 인용은 활성·검증되고 원천 스냅샷이 맞는 관계만 따릅니다. "
     "키워드 검색 히트는 검증된 인용이 아니고, 인용은 적용 확정이 아닙니다. "
@@ -1163,7 +1163,7 @@ TOOLS = [
     },
     {
         "name": "search_cases",
-        "description": "판례·조세심판원 결정례를 전문검색한다 (대법원·고등법원 판례, 조세심판원 심판례). 단일 핵심 키워드가 정확함. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
+        "description": "판례·불복 결정례를 전문검색한다 (대법원·고등법원 등 법원 판례, 조세심판원 심판례, 국세청 심사청구·이의신청·과세전적부심사 결정례). 단일 핵심 키워드가 정확함. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1544,7 +1544,11 @@ class Handler(BaseHTTPRequestHandler):
             self.legacy_sse()
             return
         # /mcp GET: 서버 주도 스트림 미지원 (stateless) — 스펙상 405 허용
-        self.send_json({"error": "Method Not Allowed"}, 405)
+        if path == "/mcp":
+            self.send_json({"error": "Method Not Allowed"}, 405)
+            return
+        # 그 밖의 경로(/.well-known/oauth-* 포함)는 404 — 인증 없는 서버임을 클라이언트가 알게
+        self.send_json({"error": "Not Found"}, 404)
 
     def do_POST(self):
         ip = self.client_ip()

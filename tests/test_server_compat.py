@@ -39,12 +39,12 @@ class SchemaCompatibilityTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
 
     def test_version_and_initialize_payload(self):
-        self.assertEqual(server.SERVER_VERSION, "0.8.0")
+        self.assertEqual(server.SERVER_VERSION, "0.8.1")
         resp = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             "127.0.0.1",
         )
-        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.8.0")
+        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.8.1")
         self.assertIn("검증", resp["result"]["instructions"])
 
     def test_tools_list_keeps_input_schema_keys(self):

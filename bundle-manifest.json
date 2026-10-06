@@ -1,10 +1,10 @@
 {
   "schema": "tax-public-mcp-bundle-v1",
-  "source_revision": "db67fb513ce23e820967941f432f985524ca73ca",
+  "source_revision": "e888538e23b254511ab2620b950fb4942bbea68e",
   "source_dirty": true,
   "files": {
     "server.py": {
-      "sha256": "69d27fdae95fd328c42e4138d9f372867150ea722dbf163fa59fa02e8d0effa8",
+      "sha256": "692f7aa097aa8949307d2b44685679b8ca5e5c1910dc83615eb3fcfb49319963",
       "source": "mcp/server.py"
     },
     "src/__init__.py": {
@@ -24,7 +24,7 @@
       "source": "src/search/__init__.py"
     },
     "src/search/cypher_templates.py": {
-      "sha256": "eb661307ff666ea4b21cc25d302e1037fb73abbd84b1b5a95fb2be9578763bf0",
+      "sha256": "2392e4d8fead56ab11001956c3a77b9533d0e183b2892c7727a17d88791b96c2",
       "source": "src/search/cypher_templates.py"
     },
     "src/search/edge_provenance.py": {
@@ -36,7 +36,7 @@
       "source": "src/search/evidence_identity.py"
     },
     "src/search/graph_searcher.py": {
-      "sha256": "671277bc7ad97c1e58a26c435054ed8b371c23a5ffdf05815b6c443c843ce244",
+      "sha256": "548702ccbc0091ed7ed4481f6f016bad4a4b356a8bf9f32544b301f030c130f1",
       "source": "src/search/graph_searcher.py"
     },
     "src/search/public_search.py": {
@@ -44,5 +44,5 @@
       "source": "src/search/public_search.py"
     }
   },
-  "payload_sha256": "28fbafa5a976b7e749a674c861e0b3938c12134c14f79080acb8d0bb30e007ab"
+  "payload_sha256": "9803067fd65701c9c5ebb475c724599005e108bbaa6d129dffa80d47ffc7f5ee"
 }

@@ -67,6 +67,11 @@ _PROVENANCE_FIELDS = (
 _FULLTEXT_GRAPH_PATH = "fulltext search"
 
 
+def _literal_fulltext_query(query: str) -> str:
+    """Treat punctuation in generated search intents as text, not Lucene syntax."""
+    return re.sub(r'([+\-!(){}\[\]^"~*?:\\/|&])', r'\\\1', query)
+
+
 def _copy_provenance(payload: dict, row: dict, graph_path: str | None = None) -> dict:
     """Overlay relationship provenance onto a node map without dropping body fields."""
     merged = dict(payload)
@@ -292,8 +297,8 @@ class GraphSearcher:
             for c in row.get("cases", []):
                 if not c:
                     continue
-                # 심판례와 일반 판례 분리
-                if c.get("court_type") == "조세심판원":
+                # 불복 결정례(조세심판원·국세청)와 법원 판례 분리
+                if c.get("court_type") in cq.DECISION_COURT_TYPES:
                     _append_unique_by(search_result.tribunals, c, "case_id")
                 else:
                     _append_unique_by(search_result.cases, c, "case_id")
@@ -498,7 +503,7 @@ class GraphSearcher:
         """조문 전문검색."""
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_ARTICLES,
-            {"query": query, "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "min_score": min_score, "limit": limit},
         )
 
     # ========================================================
@@ -680,7 +685,7 @@ class GraphSearcher:
         return self.client.execute_query(
             cq.SEARCH_AMENDMENTS,
             {
-                "query": query,
+                "query": _literal_fulltext_query(query),
                 "law_names": law_names,
                 "since": str(since).replace("-", ""),
                 "min_score": min_score,
@@ -789,7 +794,7 @@ class GraphSearcher:
         """판례 전문검색."""
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_CASES,
-            {"query": query, "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "min_score": min_score, "limit": limit},
         )
 
     def fulltext_search_rulings(
@@ -805,7 +810,7 @@ class GraphSearcher:
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_RULINGS,
             {
-                "query": query,
+                "query": _literal_fulltext_query(query),
                 "min_score": min_score,
                 "limit": limit,
                 "tax_orgs": TAX_RULING_ORGS,
@@ -818,7 +823,7 @@ class GraphSearcher:
         """국세청 질의회신(유권해석) 전문검색."""
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_INTERPRETATIONS,
-            {"query": query, "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "min_score": min_score, "limit": limit},
         )
 
     def fulltext_search_tribunals(
@@ -827,7 +832,7 @@ class GraphSearcher:
         """조세심판원 결정례 전문검색."""
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_TRIBUNALS,
-            {"query": query, "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "min_score": min_score, "limit": limit},
         )
 
     def fulltext_search_treaty_articles(
@@ -840,7 +845,7 @@ class GraphSearcher:
         """조세조약 조문 전문검색 — 국가명이 있으면 그 나라 조약으로 좁힌다."""
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_TREATY_ARTICLES,
-            {"query": query, "country": country, "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "country": country, "min_score": min_score, "limit": limit},
         )
 
     def _treaty_countries(self) -> list[str]:
@@ -997,7 +1002,7 @@ class GraphSearcher:
     ) -> list[dict]:
         return self.client.execute_query(
             cq.FULLTEXT_SEARCH_ANNEXES,
-            {"query": query, "law_name": law_name or None, "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "law_name": law_name or None, "min_score": min_score, "limit": limit},
         )
 
     def traverse_has_annex(self, article_ids: list[str], limit: int = 4) -> list[dict]:
@@ -1085,7 +1090,7 @@ class GraphSearcher:
                 if not case_data:
                     continue
                 case_data.setdefault("graph_path", _FULLTEXT_GRAPH_PATH)
-                if case_data.get("court_type") == "조세심판원":
+                if case_data.get("court_type") in cq.DECISION_COURT_TYPES:
                     _append_unique_by(result.tribunals, case_data, "case_id")
                 else:
                     _append_unique_by(result.cases, case_data, "case_id")
