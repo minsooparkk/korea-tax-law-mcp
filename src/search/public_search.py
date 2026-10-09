@@ -11,7 +11,32 @@ import re
 import time
 from datetime import date
 
-from src.search.graph_searcher import GraphSearcher
+from src.pipeline.interpretation_maintenance import MAINTENANCE_FIELDS, maintenance_metadata
+from src.search.graph_searcher import (
+    RETIREMENT_FIELDS,
+    SOURCE_OBSERVATION_FIELDS,
+    GraphSearcher,
+    administrative_retirement_notice,
+    annex_body,
+    original_attachment_url,
+    partial_case_body,
+    partial_ruling_body,
+    public_attachment_metadata,
+    public_inline_visual_metadata,
+    ruling_source_scope_notice,
+    source_date_notice,
+    source_observation_notice,
+)
+from src.search.source_quality import (
+    CATALOGUE_MATCH_FIELDS,
+    CATALOGUE_METADATA_NOTICE,
+    IMAGE_TRANSCRIPTION_FIELDS,
+    catalogue_match_reference,
+    catalogue_metadata_only,
+    image_transcription,
+    image_transcription_notice,
+    image_transcription_scope,
+)
 
 INTENT_TYPES = ("law", "case", "ruling", "tribunal", "treaty", "annex")
 BUCKET_TYPES = {
@@ -30,17 +55,18 @@ NODE_TYPES = {
 }
 BODY_FIELDS = {
     "article": ("article_content",), "article_version": ("article_content",),
-    "case": ("full_content", "full_text", "content", "body", "case_holding", "ruling_summary"),
-    "ruling": ("full_content", "full_text", "content", "body", "answer_summary", "query_summary"),
-    "interpretation": ("full_text", "full_content", "content", "body"),
-    "basic_rule": ("rule_content", "content"), "annex": ("content", "full_text"),
+    "case": ("full_content", "full_text", "content", "body", "extracted_content", "case_holding", "ruling_summary"),
+    "ruling": ("full_content", "full_text", "content", "body", "extracted_content", "answer_summary", "query_summary"),
+    "interpretation": ("full_text", "full_content", "content", "body", "extracted_content"),
+    "basic_rule": ("rule_content", "content"), "annex": ("content", "full_text", "extracted_content"),
     "amendment": ("full_content", "content", "enforcement_text", "application_text", "transitional_text"),
     "treaty_article": ("article_content", "content_ko", "content", "content_en"),
 }
 SUMMARY_FIELDS = {"case_holding", "ruling_summary", "answer_summary", "query_summary"}
 META_FIELDS = (
     "article_id", "version_id", "article_number", "article_title", "law_id", "law_name",
-    "article_type", "is_current", "verified", "source_verified", "deleted", "is_deleted",
+    "article_type", "is_historical_only", "body_scope", "source_event_type", "consolidated_rule_text_verified", "reply_text_complete", "temporal_gate_state", "content_sha256",
+    "temporal_proof_valid_from", "temporal_proof_valid_to", "temporal_proof_content_sha256", "temporal_proof_source_snapshot", "is_current", "verified", "source_verified", "deleted", "is_deleted",
     "case_id", "case_number", "case_name", "court_name", "court_type", "case_url",
     "ruling_id", "ruling_number", "ruling_title", "ruling_org", "ruling_url",
     "interp_id", "interp_number", "interp_title", "interp_url", "reply_org",
@@ -51,7 +77,15 @@ META_FIELDS = (
     "enforcement_date", "effective_date", "valid_from", "valid_to", "ruling_date", "reply_date",
     "promulgation_date", "applies_note", "applies_source", "edition_year", "temporal_resolution",
     "applicability_status", "applicable_date", "resolved_version_id", "reference_semantics",
-)
+    "date_status", "temporal_status", "source_conflict", "source_metadata_date_kind", "listing_date", "listed_decision_date", "document_decision_date", "original_document_date",
+    "original_attachment_available", "original_document_available", "text_extraction_status", "text_completeness_status",
+    "inline_visual_originals_verified", "inline_visual_original_count", "source_temporal_status", "official_current_flag", "availability_status", "availability_followup_status", "body_identity_status", "body_identity_notice", "listed_case_number", "original_case_number", "body_status", "identity_status", "source_raw_sha256", "source_observed_at",
+    "source_alias_ids", "source_kind", "source_id", "document_type", "is_whole_document", "body_representation",
+    "source_publisher", "reference_book_id", "active", "is_latest_official_edition",
+    "legal_effective_date_status", "source_publication_date", "pdf_page_count",
+    "extracted_content_sha256", "extraction_method", "original_binary_sha256", "original_binary_format",
+    "extraction_source_snapshot", "extraction_source_url", "extraction_geometry_verified", "extraction_provenance",
+) + MAINTENANCE_FIELDS + RETIREMENT_FIELDS + SOURCE_OBSERVATION_FIELDS + CATALOGUE_MATCH_FIELDS + IMAGE_TRANSCRIPTION_FIELDS
 ORIGINAL_LIMIT = 12000
 MAX_BODY_PAGE = 24000
 NOTICE = (
@@ -122,9 +156,28 @@ def validate_search(args):
 def original_text(evidence_type, evidence_id, node, *, offset=0, limit=ORIGINAL_LIMIT, source_field=None):
     fields = BODY_FIELDS[evidence_type]
     available = [f for f in fields if isinstance(node.get(f), str) and node[f].strip()]
+    transcription = image_transcription(node) if evidence_type in {"case", "interpretation"} else ""
+    if evidence_type == "case" and "extracted_content" in available and not partial_case_body(node) and not transcription:
+        available.remove("extracted_content")
+        if source_field == "extracted_content":
+            raise ValueError("검증된 첨부 부분추출문을 확인할 수 없습니다.")
+    if evidence_type == "interpretation" and "extracted_content" in available and not transcription:
+        available.remove("extracted_content")
+        if source_field == "extracted_content":
+            raise ValueError("현재 원문에 연결된 이미지 전사 자료를 확인할 수 없습니다.")
+    if evidence_type == "ruling" and "extracted_content" in available and not partial_ruling_body(node):
+        available.remove("extracted_content")
+        if source_field == "extracted_content":
+            raise ValueError("검증된 행정규칙 부속자료 추출문을 확인할 수 없습니다.")
+    if (evidence_type == "annex" and "extracted_content" in available
+            and annex_body(node)[1] != "extracted_attachment"):
+        available.remove("extracted_content")
+        if source_field == "extracted_content":
+            raise ValueError("현재 원문 스냅샷에 연결된 첨부 추출문을 확인할 수 없습니다.")
     if source_field is not None and source_field not in fields:
         raise ValueError("지원하지 않는 원문 필드입니다.")
-    selected = source_field or next(iter(available), None)
+    selected = source_field or next((field for field in available
+                                     if not (transcription and field == "extracted_content")), None)
     # These are separate original supplementary provisions. Keep all three when
     # no complete Amendment body exists instead of silently keeping only enforcement.
     if evidence_type == "amendment" and source_field is None and selected in fields[2:]:
@@ -134,6 +187,19 @@ def original_text(evidence_type, evidence_id, node, *, offset=0, limit=ORIGINAL_
         text = node.get(selected, "") if selected else ""
         text = text if isinstance(text, str) else ""
     kind = "missing" if not text else "summary_only" if selected in SUMMARY_FIELDS else "original"
+    if selected == "extracted_content" and text:
+        kind = "partial_extraction" if evidence_type in {"case", "ruling"} else "extracted_attachment"
+    body_status = node.get("body_status")
+    if text and body_status == "partial_extraction":
+        kind = "partial_extraction"
+    if text and body_status == "summary_only":
+        kind = "summary_only"
+    selected_transcription = bool(selected == "extracted_content" and transcription)
+    if selected_transcription:
+        kind = "image_transcription"
+    metadata_only = evidence_type == "interpretation" and catalogue_metadata_only(node)
+    if metadata_only:
+        kind = "metadata_only"
     chunk = text[offset:offset + limit]
     next_offset = offset + len(chunk) if offset + len(chunk) < len(text) else None
     continuation = None
@@ -143,8 +209,28 @@ def original_text(evidence_type, evidence_id, node, *, offset=0, limit=ORIGINAL_
         if source_field:
             arguments["source_field"] = source_field
         continuation = {"tool": "get_evidence", "arguments": arguments}
+    complete = body_status not in {"empty", "summary_only", "attachment_only", "source_empty", "partial_source_empty", "partial_extraction", "identity_anchor_only", "unknown"}
+    if node.get("body_identity_status") == "unresolved":
+        complete = False
+    reply_complete = evidence_type == "interpretation" and body_status == "reply_complete" and not metadata_only and not selected_transcription
+    if reply_complete and not (isinstance(node.get("full_text"), str) and node["full_text"].strip()):
+        complete = False
     return {"text": chunk, "kind": kind, "source_field": selected,
-            "available_fields": available, "full_text_available": bool(text) and kind == "original",
+            "body_status": body_status,
+            "body_identity_status": node.get("body_identity_status"),
+            "body_identity_notice": node.get("body_identity_notice"),
+            "source_observation_notice": source_observation_notice(node),
+            "body_scope": "catalogue_metadata" if metadata_only else "image_transcription_supplement" if selected_transcription else "official_reply" if reply_complete else node.get("body_scope"),
+            "reply_text_complete": reply_complete,
+            "body_notice": (CATALOGUE_METADATA_NOTICE if metadata_only else "전문 확보가 확인되지 않은 자료입니다. 보존된 요지·회신의 범위를 확인하세요."
+                            if body_status == "empty" else "공식 원천의 일부 조항 본문이 공란인 발간본으로, 확보된 부분만 제공합니다."
+                            if body_status == "partial_source_empty" else ruling_source_scope_notice(node)),
+            "transcription_scope": image_transcription_scope(node) if selected_transcription else None,
+            "extraction_notice": (image_transcription_notice(node) if selected_transcription else "공식 첨부에서 추출한 텍스트이며 표의 행·열 구조는 검증되지 않았습니다."
+                                  if kind == "extracted_attachment" else
+                                  "원문에서 확보한 문자입니다. 그림·수식·표의 행·열 구조와 완전성은 확인되지 않았으므로 원본을 확인하세요."
+                                  if kind == "partial_extraction" else None),
+            "available_fields": available, "full_text_available": bool(text) and kind == "original" and complete,
             "offset": offset, "total_chars": len(text), "truncated": next_offset is not None,
             "next_offset": next_offset, "continuation": continuation}
 
@@ -152,6 +238,11 @@ def original_text(evidence_type, evidence_id, node, *, offset=0, limit=ORIGINAL_
 def temporal_metadata(node):
     """No date inference: publication/decision date is not a validity interval."""
     return {
+        "source_date_notice": source_date_notice(node),
+        "retirement_notice": administrative_retirement_notice(node),
+        "date_status": node.get("date_status") or node.get("temporal_status"),
+        "listing_date": node.get("listing_date") or node.get("listed_decision_date"),
+        "document_decision_date": node.get("document_decision_date") or node.get("original_document_date"),
         "document_date": node.get("ruling_date") or node.get("reply_date") or node.get("promulgation_date"),
         "enforcement_date": node.get("enforcement_date") or node.get("effective_date"),
         "valid_from": node.get("valid_from"), "valid_to": node.get("valid_to"),
@@ -193,28 +284,73 @@ class PublicGraphSearch:
         if not ids:
             return {}
         label, key = NODE_TYPES[evidence_type]
-        fields = tuple(dict.fromkeys((*META_FIELDS, *BODY_FIELDS[evidence_type])))
+        private_fields = ("source_attachment_receipts_json", "source_attachment_groups_json",
+                          "source_visual_evidence_json", "source_inline_visual_receipts_json", "raw_sha256",
+                          "source_gazette_receipt_json", "source_gazette_page_index") if evidence_type == "ruling" else ()
+        fields = tuple(dict.fromkeys((*META_FIELDS, *BODY_FIELDS[evidence_type], *private_fields)))
         # Only constants define Cypher identifiers; user IDs remain parameters.
         query = (f"MATCH (n:{label}) WHERE n.{key} IN $ids "
                  "RETURN n {" + ", ".join(f".{f}" for f in fields) + "} AS node")
-        return {r["node"][key]: r["node"] for r in self.execute_query(query, {"ids": ids})
-                if r.get("node", {}).get(key)}
+        found = {r["node"][key]: r["node"] for r in self.execute_query(query, {"ids": ids})
+                 if r.get("node", {}).get(key)}
+        missing = [ident for ident in ids if ident not in found]
+        if evidence_type in ("interpretation", "case") and missing and label in ("Interpretation", "Case"):
+            # 합쳐진 중복 문서의 옛 ID도 대표 문서로 찾는다(판례는 2026-10-09 중복 정리분)
+            alias_query = (f"MATCH (n:{label}) WHERE any(alias IN $ids "
+                           "WHERE alias IN coalesce(n.source_alias_ids, [])) RETURN n {"
+                           + ", ".join(f".{field}" for field in fields) + "} AS node")
+            rows = self.execute_query(alias_query, {"ids": missing})
+            for ident in missing:
+                candidates = {r["node"][key]: r["node"] for r in rows
+                              if r.get("node", {}).get(key)
+                              and ident in (r["node"].get("source_alias_ids") or [])}
+                if len(candidates) > 1:
+                    raise ValueError("같은 원천 별칭이 여러 문서에 연결되어 원문을 확정할 수 없습니다.")
+                if candidates:
+                    found[ident] = next(iter(candidates.values()))
+        return found
 
     def _evidence(self, bucket, kind, node):
         key = NODE_TYPES[kind][1]
         ident = node.get(key) or node.get("resolved_version_id")
         paths = node.get("graph_paths") or []
         source = {k: node[k] for k in META_FIELDS if k in node and k not in BODY_FIELDS[kind]}
+        source.pop("source_image_transcriptions_json", None)
         for k in ("hwp_url", "pdf_url"):
             if source.get(k):
                 source[k] = law_file_url(source[k])
         if node.get("_content_snapshot"):
             source["source_snapshot"] = node["_content_snapshot"]
-        return {"evidence_type": kind, "evidence_id": ident, "result_group": bucket,
+        if kind == "interpretation" and catalogue_metadata_only(node):
+            source["body_scope"] = "catalogue_metadata"
+        if kind == "interpretation":
+            if matched := catalogue_match_reference(node):
+                source["catalogue_match"] = matched
+                source["catalogue_match_notice"] = matched["notice"]
+            else:
+                for field in CATALOGUE_MATCH_FIELDS:
+                    source.pop(field, None)
+        if kind == "ruling" and (visuals := public_inline_visual_metadata(node)):
+            source["inline_visuals"] = visuals
+        if kind == "ruling" and (attachments := public_attachment_metadata(node)):
+            source["attachments"] = attachments
+        if kind == "case" and (attachment := original_attachment_url(node)):
+            source["original_attachment_url"] = attachment
+        response = {"evidence_type": kind, "evidence_id": ident, "result_group": bucket,
                 "source": source, "graph_paths": paths,
                 "retrieval_method": "graph" if paths else node.get("graph_path") or "direct_lookup",
                 "original_text": original_text(kind, ident, node),
                 "temporal": temporal_metadata(node)}
+        if kind in {"case", "interpretation"} and (transcription := image_transcription(node)):
+            response["supplements"] = [{"kind": "image_transcription", "source_field": "extracted_content",
+                                       "total_chars": len(transcription), "notice": image_transcription_notice(node),
+                                       "scope": image_transcription_scope(node),
+                                       "sha256": node["extracted_content_sha256"],
+                                       "access": {"tool": "get_evidence", "arguments": {
+                                           "evidence_type": kind, "evidence_id": ident, "source_field": "extracted_content"}}}]
+        if kind == "interpretation" and (maintenance := maintenance_metadata(node)):
+            response["maintenance"] = maintenance
+        return response
 
     def search(self, args):
         intents, offset, limit, as_of = validate_search(args)
@@ -223,9 +359,12 @@ class PublicGraphSearch:
         found = searcher.search_for_query(intents)
         entries = [(bucket, kind, dict(node)) for bucket, kind in BUCKET_TYPES.items()
                    for node in sorted(getattr(found, bucket, []),
-                                      key=lambda n: str(n.get(NODE_TYPES[kind][1]) or n.get("resolved_version_id") or ""))]
+                                      key=lambda n: str(n.get(NODE_TYPES[kind][1]) or n.get("resolved_version_id") or ""))
+                   if (kind != "case" or node.get("body_identity_status") != "unresolved")
+                   and (kind != "interpretation" or not catalogue_metadata_only(node))]
         identities = [(b, k, n.get(NODE_TYPES[k][1]) or n.get("resolved_version_id"),
-                       n.get("_content_snapshot") or n.get("source_snapshot")) for b, k, n in entries]
+                       n.get("_content_snapshot") or n.get("source_snapshot"),
+                       n.get("maintenance_semantic_revision")) for b, k, n in entries]
         result_set_id = hashlib.sha256(json.dumps(
             {"intents": intents, "as_of": as_of, "identities": identities},
             sort_keys=True, ensure_ascii=False, default=str,
@@ -245,6 +384,11 @@ class PublicGraphSearch:
         for bucket, kind, searched in selected:
             ident = searched.get(NODE_TYPES[kind][1]) or searched.get("resolved_version_id")
             raw = originals[kind].get(ident, {})
+            if kind == "interpretation" and (catalogue_metadata_only(raw) or catalogue_metadata_only(searched)):
+                continue
+            if kind == "case" and (raw.get("body_identity_status") == "unresolved"
+                                   or searched.get("body_identity_status") == "unresolved"):
+                continue
             searched_snapshot = searched.get("_content_snapshot")
             if searched_snapshot and raw.get("source_snapshot") and searched_snapshot != raw["source_snapshot"]:
                 raise RuntimeError("검색 중 근거 원문이 갱신되었습니다. 다시 검색하세요.")
@@ -295,4 +439,6 @@ class PublicGraphSearch:
         response = self._evidence("direct_lookup", kind, node)
         response["original_text"] = original_text(kind, ident, node, offset=offset, limit=limit, source_field=field)
         response.update({"found": True, "notice": NOTICE})
+        if response["evidence_id"] != ident:
+            response["requested_evidence_id"] = ident
         return response

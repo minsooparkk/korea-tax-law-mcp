@@ -11,6 +11,7 @@ additive.
 from __future__ import annotations
 
 from src.pipeline.document_projection import DOCUMENT_PROJECTION_SCHEMA
+from src.search.evidence_identity import temporal_proof_guard
 
 DOCUMENT_PROJECTION_KIND = "stored_document_projection"
 DOCUMENT_PROJECTION_SNAPSHOT_PREFIX = "stored-document:v1:sha256:"
@@ -106,6 +107,8 @@ def document_citation_guard(*, document: str, article: str, edge: str = "rel") -
     return _and(
         active_verified_guard(edge=edge),
         document_projection_guard(document=document, edge=edge),
+        f"coalesce({document}.body_identity_status, '') <> 'unresolved'",
+        temporal_proof_guard(article),
         f"{edge}.source_snapshot = {official_document_snapshot(document=document)}",
         _nonempty(f"{edge}.source_snapshot"),
         _same_nonempty(f"{edge}.target_source_snapshot", f"{article}.source_snapshot"),
@@ -244,6 +247,7 @@ def applicability_evidence_guard(
 def article_version_source_backed(*, version: str = "v") -> str:
     """Official snapshot body. Closed historical versions may be source_verified only."""
     return _and(
+        temporal_proof_guard(version),
         (
             f"(coalesce({version}.verified, false) = true OR "
             f"coalesce({version}.source_verified, false) = true)"
@@ -281,6 +285,7 @@ def current_correspondence_guard(
 ) -> str:
     """ArticleVersion to current Article successor. Not continued applicability."""
     return _and(
+        temporal_proof_guard(version),
         active_verified_guard(edge=edge),
         f"{edge}.reference_semantics = 'current_correspondence_only'",
         f"{edge}.does_not_imply_continued_applicability = true",

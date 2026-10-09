@@ -18,7 +18,7 @@ https://mcp.taxdoctorai.com/mcp
 
 ## 도구
 
-현재 버전 **v0.8.1** ([CHANGELOG](CHANGELOG.md))
+현재 버전 **v0.9.1** ([CHANGELOG](CHANGELOG.md))
 
 `search_tax`는 로컬 tax-ai-agent의 `GraphSearcher.search_for_query`와 같은 코드를
 사용합니다. 법률→시행령→시행규칙과 연결 문서를 탐색하고, 각 결과에 실제 노드·관계
@@ -34,7 +34,8 @@ https://mcp.taxdoctorai.com/mcp
 | `get_article` | 조문 현행 원문 전체 + 시행일 + 검증된 위임·별표·인용 |
 | `get_article_history` | 조문 개정 연혁 ("언제 바뀌었나"). 미검증 버전 표시 |
 | `search_cases` | 판례·조세심판원 결정례·국세청 심사·이의·적부 결정례 키워드 검색 (검증된 인용 아님) |
-| `search_interpretations` | 국세청·법제처·행정안전부 해석례 키워드 검색 (검증된 인용 아님) |
+| `search_interpretations` | 국세청·법제처·행정안전부 해석례 검색. 쟁점 문장·키워드·문서번호 모두 받음 (검증된 인용 아님) |
+| `verify_citations` | 초안의 해석례·판례 문서번호와 '법령명 제N조'가 실제로 있는지 확인 (존재 확인, 내용 일치 아님) |
 | `search_annexes` | 별표·서식 검색 (세율표·기준금액·분류표) |
 | `get_annex` | 별표 본문 전체 + 원본 HWP·PDF 링크 |
 | `list_upcoming` | 공포됐으나 시행 전인 개정 조문 |

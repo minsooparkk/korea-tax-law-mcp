@@ -18,6 +18,7 @@ STABLE_TOOLS = {
     "get_article_history": ["law_name", "article_number"],
     "search_cases": ["query"],
     "search_interpretations": ["query"],
+    "verify_citations": ["text"],
     "search_annexes": ["query"],
     "get_annex": ["law_name", "annex_number"],
     "list_upcoming": [],
@@ -39,12 +40,12 @@ class SchemaCompatibilityTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
 
     def test_version_and_initialize_payload(self):
-        self.assertEqual(server.SERVER_VERSION, "0.8.1")
+        self.assertEqual(server.SERVER_VERSION, "0.9.1")
         resp = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             "127.0.0.1",
         )
-        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.8.1")
+        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.9.1")
         self.assertIn("검증", resp["result"]["instructions"])
 
     def test_tools_list_keeps_input_schema_keys(self):
@@ -201,3 +202,40 @@ class GetArticleFormatTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterpretationRankingTests(unittest.TestCase):
+    def test_korean_stems_drop_particles_and_filler(self):
+        self.assertEqual(server.ko_stems("출자공동사업자의 배당소득에 대한 세액감면 적용 여부"),
+                         ["출자공동사업자", "배당소득", "세액감면"])
+
+    def test_bigram_similarity_ignores_spacing(self):
+        self.assertGreater(server.bigram_sim("적용 여부", "적용여부"), 0.99)
+
+    def test_doc_key_ignores_format_and_leading_zeros(self):
+        self.assertEqual(server.doc_key("서면-2023-법규소득-0950"), server.doc_key("서면2023법규소득950"))
+        self.assertEqual(server.interp_number_keys("서면-2023-법규기본-2595[법규과-2973]"),
+                         [server.doc_key("서면-2023-법규기본-2595"), server.doc_key("법규과-2973")])
+
+    def test_number_patterns_skip_article_numbers(self):
+        text = "법인세법 제52조와 서면-2023-법규기본-2595, 기획재정부 소득세제과-1059, 2015두41937, 조심2023서1234"
+        self.assertEqual([m.group(0) for m in server.INTERP_NO_RE.finditer(text)],
+                         ["서면-2023-법규기본-2595", "기획재정부 소득세제과-1059"])
+        self.assertEqual([m.group(0) for m in server.CASE_NO_RE.finditer(text)], ["2015두41937", "조심2023서1234"])
+
+    def test_lookup_requires_exact_normalized_number(self):
+        rows = [{"id": "a", "no": "서면-2023-법규기본-2595[법규과-2973]"}, {"id": "b", "no": "서면-2023-법규기본-12595"},
+                {"id": "c", "no": "사전-202-3법규부가0594"}]
+        with mock.patch.object(server, "cypher", return_value=rows):
+            self.assertEqual([r["id"] for r in server.lookup_interp_numbers("서면-2023-법규기본-2595")], ["a"])
+            self.assertEqual([r["id"] for r in server.lookup_interp_numbers("법규과-2973")], ["a"])
+            self.assertEqual([r["id"] for r in server.lookup_interp_numbers("사전-2023-법규부가-0594")], ["c"])
+            self.assertEqual(server.lookup_interp_numbers("서면-2023-법규기본-9595"), [])
+
+    def test_rerank_lifts_title_match_over_long_body_match(self):
+        body = [{"id": "long", "title": "가산세 일반", "preview": "", "score": 10.0},
+                {"id": "short", "title": "출자공동사업자 배당소득 창업중소기업 세액감면 적용여부", "preview": "", "score": 4.0}]
+        title = [{"id": "short", "title": body[1]["title"], "preview": "", "score": 4.0}]
+        with mock.patch.object(server, "_interp_rows", side_effect=[body, title]):
+            ranked = server.rank_interpretations("출자공동사업자 배당소득의 창업중소기업 세액감면 적용 여부", 2)
+        self.assertEqual([r["id"] for r in ranked], ["short", "long"])

@@ -1,10 +1,10 @@
 {
   "schema": "tax-public-mcp-bundle-v1",
-  "source_revision": "e888538e23b254511ab2620b950fb4942bbea68e",
+  "source_revision": "2e2bf9df03db59a327bb2b3494a34d8a31284aac",
   "source_dirty": true,
   "files": {
     "server.py": {
-      "sha256": "692f7aa097aa8949307d2b44685679b8ca5e5c1910dc83615eb3fcfb49319963",
+      "sha256": "fb6429ce5a3a11d6fdc6320ccf105a7b2a1275baa555744ac880038e6d09832c",
       "source": "mcp/server.py"
     },
     "src/__init__.py": {
@@ -19,30 +19,38 @@
       "sha256": "4e57938528c5f17c74ce30a394a72102bca2b0125142a1a33483baf78325a267",
       "source": "src/pipeline/document_projection.py"
     },
+    "src/pipeline/interpretation_maintenance.py": {
+      "sha256": "fbf07fa9301e1c816ec3c656a5787d379c0ea507e4d853f7959b91412be663ba",
+      "source": "src/pipeline/interpretation_maintenance.py"
+    },
     "src/search/__init__.py": {
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": "src/search/__init__.py"
     },
     "src/search/cypher_templates.py": {
-      "sha256": "2392e4d8fead56ab11001956c3a77b9533d0e183b2892c7727a17d88791b96c2",
+      "sha256": "c6cd9650c0621114680e52b21c38a9b911df56290f1b642be804a51957b1b35c",
       "source": "src/search/cypher_templates.py"
     },
     "src/search/edge_provenance.py": {
-      "sha256": "df4aabfe97720cb7d0fcefe600dbb993dd4c3618904682e0f92d2cd0a0cb70b6",
+      "sha256": "f4c4d74207675934657f211e416597eb26c87c456cf0119a79fbe8319ff68572",
       "source": "src/search/edge_provenance.py"
     },
     "src/search/evidence_identity.py": {
-      "sha256": "643cf8e9b038ddd9db190252e9b1c12ed851922497a3ac403279a85189567141",
+      "sha256": "3cdfeffddd0acf7fba4bf33376eb55e3e18cf60dcf9a2aacf02b322e8ee6ef4b",
       "source": "src/search/evidence_identity.py"
     },
     "src/search/graph_searcher.py": {
-      "sha256": "548702ccbc0091ed7ed4481f6f016bad4a4b356a8bf9f32544b301f030c130f1",
+      "sha256": "6b754dc284ce8189758f122706889c60bc55c8d868857f7d6331be115f6237bf",
       "source": "src/search/graph_searcher.py"
     },
     "src/search/public_search.py": {
-      "sha256": "46b637c9b3de72e13e1881bac33a12d64d5e301c72517af441f2f2630daed803",
+      "sha256": "ecefb8ea81d55c65732edbaaa65a010ed3c836ca18ab738750eca8797c12d9d4",
       "source": "src/search/public_search.py"
+    },
+    "src/search/source_quality.py": {
+      "sha256": "4e0c7ef0f59cf910d4fbeb21cd37a715a83b4f7341d4b2e550ab22c27a3ef2ed",
+      "source": "src/search/source_quality.py"
     }
   },
-  "payload_sha256": "9803067fd65701c9c5ebb475c724599005e108bbaa6d129dffa80d47ffc7f5ee"
+  "payload_sha256": "2f99162fa04df23cbc87f65f3cacbe8686ddca47c57a5fed3a0875f6398a8e74"
 }

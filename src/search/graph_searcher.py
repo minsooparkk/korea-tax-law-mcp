@@ -2,12 +2,251 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlparse
 
+from src.pipeline.interpretation_maintenance import decorate_interpretation
 from src.search import cypher_templates as cq
+from src.search.source_quality import (
+    catalogue_metadata_only,
+    image_transcription,
+    image_transcription_matches,
+)
+
+CASE_ATTACHMENT_ID_PATTERNS = {
+    "nts_bai_attachment": r"bai_[0-9]+", "bai_public_attachment": r"bai_[0-9]+",
+    "ccourt_case_attachment": r"detc_[0-9]+", "tt_case_attachment": r"tribunal_[0-9]+",
+    "tt_precedent_attachment": r"[0-9]+",
+}
+RETIREMENT_FIELDS = (
+    "retirement_reason", "retirement_effective_date", "retirement_notice", "retirement_source_url",
+    "retired_by_repeal_receipt_id", "retired_by_administrative_event_id", "retired_by_ruling_id",
+)
+SOURCE_OBSERVATION_FIELDS = (
+    "latest_source_observation_status", "latest_source_observation_kind", "latest_source_observation_at",
+    "latest_source_observation_raw_sha256", "latest_source_observation_url",
+)
+
+
+def source_observation_notice(source: dict) -> str | None:
+    """An unavailable current response does not invalidate a preserved original."""
+    if (source.get("latest_source_observation_status") != "detail_unavailable_observed"
+            or source.get("latest_source_observation_kind") != "nts_action_dcm_null"
+            or not re.fullmatch(r"[0-9a-f]{64}", source.get("latest_source_observation_raw_sha256") or "")):
+        return None
+    observed = source.get("latest_source_observation_at") or ""
+    try:
+        latest = datetime.fromisoformat(observed)
+        if latest.tzinfo is None:
+            return None
+        preserved_at = source.get("source_observed_at")
+        observed_url = urlparse(source.get("latest_source_observation_url") or "")
+        same_nts_source = (source.get("source_kind") == "nts_action_detail"
+                           and observed_url.hostname == "taxlaw.nts.go.kr"
+                           and parse_qs(observed_url.query).get("ntstDcmId") == [source.get("source_id")])
+        if preserved_at and same_nts_source:
+            successful = datetime.fromisoformat(preserved_at)
+            if successful.tzinfo and successful > latest:
+                return None
+    except (TypeError, ValueError):
+        return None
+    metadata_only = catalogue_metadata_only(source)
+    preserved = ("기존 목록·문서정보를 보존하며 실제 본문은 확보되지 않았습니다. "
+                 if metadata_only else "기존에 저장된 자료를 보존하며 원천 상태 재확인이 필요합니다. ")
+    limitation = ("원천 문서의 삭제·폐지를 확인한 것은 아닙니다." if metadata_only else
+                  "삭제·폐지 또는 기존 원문의 무효를 뜻하지 않습니다.")
+    return (f"최근 공식 상세 조회에서 문서 정보가 반환되지 않았습니다(확인: {observed}). " + preserved +
+            limitation)
+
+
+def _interpretation_evidence(source: dict) -> dict:
+    source = dict(source)
+    if source.get("extracted_content") and not image_transcription(source):
+        source.pop("extracted_content")
+    return decorate_interpretation(source)
+
+
+def administrative_retirement_notice(source: dict) -> str | None:
+    if (source.get("retirement_reason") != "official_explicit_repeal"
+            or not source.get("retired_by_repeal_receipt_id")):
+        return None
+    return source.get("retirement_notice") or "공식 폐지 원천이 확인된 과거 자료입니다. 보존된 원문을 현행 규정으로 사용하지 마세요."
+
+
+def ruling_source_scope_notice(source: dict) -> str | None:
+    if source.get("body_scope") == "complete_official_repeal_notice":
+        return "공식 공보의 해당 폐지 고지 전문입니다. 폐지된 규정의 통합 본문이 아니며 공보 전체를 전사한 자료도 아닙니다."
+    if source.get("body_scope") == "official_supporting_documents_only":
+        return "이유서·개정안·대비표 등 공식 첨부자료를 보존했으며, 전체 규칙 본문으로 검증되지는 않았습니다. 원본의 범위와 적용 시기를 확인하세요."
+    if source.get("source_kind") == "law_admrul_xml" and source.get("body_status") == "attachment_only":
+        return "공식 XML 원문에서 확보한 문자입니다. 포함된 그림·표의 구조와 완전성은 원본 확인이 필요합니다."
+    if source.get("source_event_type") == "repeal":
+        return "공식 원천에서 폐지 사건으로 구분된 자료입니다. 이 원문을 현행 규정으로 사용하지 마세요."
+    return None
+
+
+def original_attachment_url(source: dict) -> str | None:
+    if source.get("identity_status") != "confirmed" or source.get("original_attachment_available") is not True:
+        return None
+    pattern = CASE_ATTACHMENT_ID_PATTERNS.get(source.get("source_kind"))
+    ident = source.get("case_id") or ""
+    if not pattern or not re.fullmatch(pattern, ident):
+        return None
+    return f"https://taxdoctorai.com/api/sources/case/{ident}/attachment"
+
+
+def partial_case_body(source: dict) -> str:
+    """A hash-bound extraction is usable as a derivative, never as full original."""
+    text = source.get("extracted_content") or ""
+    if (not (source.get("full_content") or "").strip() and source.get("body_status") == "attachment_only"
+            and source.get("identity_status") == "confirmed"
+            and source.get("source_kind") in CASE_ATTACHMENT_ID_PATTERNS
+            and text.strip() and hashlib.sha256(text.encode()).hexdigest() == source.get("extracted_content_sha256")
+            and re.fullmatch(r"[0-9a-f]{64}", source.get("source_raw_sha256") or "")):
+        return text
+    return ""
+
+
+
+def partial_ruling_body(source: dict) -> str:
+    text = source.get("extracted_content") or ""
+    canonical = (source.get("content") or source.get("full_content") or source.get("full_text") or "").strip()
+    if (not canonical and source.get("body_status") == "attachment_only"
+            and source.get("identity_status") == "confirmed" and source.get("source_kind") in {"law_admrul_attachments", "law_admrul_xml"}
+            and text.strip() and hashlib.sha256(text.encode()).hexdigest() == source.get("extracted_content_sha256")
+            and re.fullmatch(r"[0-9a-f]{64}", source.get("source_raw_sha256") or "")):
+        return text
+    return ""
+
+
+
+def public_attachment_metadata(source: dict) -> list[dict]:
+    """Expose verified source links and roles, never server artifact paths."""
+    def rows(key):
+        try:
+            value = json.loads(source.get(key) or "[]")
+        except (TypeError, ValueError):
+            return []
+        return value if isinstance(value, list) else []
+
+    roles = {}
+    for group in rows("source_attachment_groups_json"):
+        if not isinstance(group, dict):
+            continue
+        selected = group.get("selected_receipt") or {}
+        if isinstance(selected, dict):
+            roles.setdefault(selected.get("raw_sha256"), []).append({
+                key: group[key] for key in ("group_key", "role", "extraction_complete") if key in group})
+    result = []
+    for receipt in rows("source_attachment_receipts_json"):
+        if not isinstance(receipt, dict):
+            continue
+        url, digest = receipt.get("source_url") or "", receipt.get("raw_sha256") or ""
+        parsed = urlparse(url)
+        if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+                or parsed.hostname not in {"law.go.kr", "www.law.go.kr", "taxlaw.nts.go.kr", "www.bai.go.kr"}
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            continue
+        result.append({"url": re.sub(r"^http:", "https:", url), "filename": receipt.get("source_filename") or "공식 첨부",
+                       "sha256": digest, "observed_at": receipt.get("observed_at"), "groups": roles.get(digest, [])})
+    if source.get("source_kind") == "law_admrul_gazette":
+        try:
+            gazette = json.loads(source.get("source_gazette_receipt_json") or "{}")
+        except (TypeError, ValueError):
+            gazette = {}
+        if isinstance(gazette, dict):
+            url, digest = gazette.get("source_url") or "", gazette.get("raw_sha256") or ""
+            parsed = urlparse(url)
+            page = source.get("source_gazette_page_index")
+            if (parsed.scheme == "https" and parsed.hostname == "www.scourt.go.kr"
+                    and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+                    and re.fullmatch(r"/upload/gongbo/Scourt07500/\d{4}-\d{4}\.pdf", parsed.path)
+                    and re.fullmatch(r"[0-9a-f]{64}", digest) and isinstance(page, int) and 0 <= page < 10000):
+                result.append({"url": url + f"#page={page + 1}", "filename": "공식 공보 해당 폐지 고지",
+                               "sha256": digest, "page_number": page + 1,
+                               "observed_at": gazette.get("observed_at"), "groups": []})
+    return result
+
+
+
+def public_inline_visual_metadata(source: dict) -> list[dict]:
+    """Only connect images still bound to this document's current body/receipt."""
+    if source.get("inline_visual_originals_verified") is not True:
+        return []
+    try:
+        evidence = json.loads(source.get("source_visual_evidence_json") or "{}")
+        receipts = json.loads(source.get("source_inline_visual_receipts_json") or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(evidence, dict) or not isinstance(receipts, list):
+        return []
+    snapshot = source.get("_content_snapshot") or source.get("source_snapshot")
+    if evidence.get("source_snapshot") and evidence["source_snapshot"] != snapshot:
+        return []
+    canonical = source.get("content") or source.get("answer_summary") or source.get("query_summary") or ""
+    body_sha = hashlib.sha256(canonical.encode()).hexdigest()
+    if not evidence.get("body_sha256") or evidence["body_sha256"] != body_sha:
+        return []
+    receipt_sha = (evidence.get("canonical_receipt") or {}).get("raw_sha256")
+    raw_sha = source.get("raw_sha256") or source.get("source_raw_sha256")
+    if receipt_sha and receipt_sha != raw_sha:
+        return []
+    if not (receipt_sha or (snapshot and evidence.get("source_snapshot") == snapshot)):
+        return []
+    identifiers = set(re.findall(r'<img\b[^>]*\bid=["\']?([0-9]+)', canonical, re.IGNORECASE))
+    assets = {str(row.get("source_visual_id")): row for row in evidence.get("assets", []) if isinstance(row, dict)}
+    output = []
+    for row in receipts:
+        if not isinstance(row, dict):
+            continue
+        ident = str(row.get("source_visual_id") or "")
+        digest, url = row.get("raw_sha256") or "", row.get("source_url") or ""
+        parsed = urlparse(url)
+        if (ident not in identifiers or assets.get(ident, {}).get("asset_sha256") != digest
+                or not re.fullmatch(r"[0-9a-f]{64}", digest) or parsed.scheme != "https"
+                or parsed.hostname not in {"law.go.kr", "www.law.go.kr"} or parsed.username or parsed.password):
+            return []
+        output.append({"source_visual_id": ident, "url": url, "sha256": digest,
+                       "format": row.get("format"), "width": row.get("width"), "height": row.get("height"),
+                       "original_verified": True, "text_transcription_verified": False})
+    return output if {row["source_visual_id"] for row in output} == identifiers else []
+
+
+def source_date_notice(source: dict) -> str | None:
+    """Disclose conflicting source dates without choosing a legal effective date."""
+    conflict = (source.get("date_status") in {"source_date_conflict", "source_conflict"}
+                or source.get("temporal_status") == "source_conflict"
+                or source.get("source_conflict") is True)
+    if not conflict:
+        return None
+    listed = source.get("listing_date") or source.get("listed_decision_date") or "미확인"
+    document = source.get("document_decision_date") or source.get("original_document_date") or "미확인"
+    label = "DB에 보존된 결정일" if source.get("source_metadata_date_kind") == "stored_legacy_ruling_date" else "공식 목록의 결정일"
+    return (f"{label}({listed})과 원문에 표시된 결정일({document})이 다릅니다. "
+            "두 원천의 날짜를 보존했으며 법적 기준일은 확정하지 않았습니다.")
+
+
+def annex_body(annex: dict) -> tuple[str, str]:
+    """Use a receipt-bound derivative only when authoritative XML text is empty."""
+    original = annex.get("content") or ""
+    if original.strip():
+        return original, "original"
+    extracted = annex.get("extracted_content") or ""
+    snapshot = annex.get("source_snapshot") or annex.get("_content_snapshot")
+    if (extracted.strip() and snapshot
+            and annex.get("extraction_source_snapshot") == snapshot
+            and annex.get("extraction_provenance") == "verified_official_attachment_text_derivative"
+            and hashlib.sha256(extracted.encode()).hexdigest() == annex.get("extracted_content_sha256")
+            and re.fullmatch(r"[0-9a-f]{64}", annex.get("original_binary_sha256") or "")):
+        return extracted, "extracted_attachment"
+    return "", "missing"
+
 
 if TYPE_CHECKING:
     from src.db.neo4j_client import Neo4jClient
@@ -310,7 +549,8 @@ class GraphSearcher:
                 _append_unique_by(search_result.referenced_articles, ref, "article_id")
 
             for interp in row.get("interpretations", []):
-                _append_unique_by(search_result.interpretations, interp, "interp_id")
+                if not catalogue_metadata_only(interp):
+                    _append_unique_by(search_result.interpretations, _interpretation_evidence(interp), "interp_id")
 
             for amendment in row.get("applicability_evidence", []):
                 _append_unique_by(
@@ -427,8 +667,9 @@ class GraphSearcher:
             cq.TRAVERSE_HAS_INTERPRETATION, {"article_id": article_id}
         )
         return [
-            _copy_provenance(row.get("interpretation") or {}, row, "HAS_INTERPRETATION edge")
-            for row in rows
+            _interpretation_evidence(_copy_provenance(
+                row.get("interpretation") or {}, row, "HAS_INTERPRETATION edge"))
+            for row in rows if not catalogue_metadata_only(row.get("interpretation") or {})
         ]
 
     def traverse_cites_article(self, case_id: str) -> list[dict]:
@@ -821,10 +1062,22 @@ class GraphSearcher:
         self, query: str, min_score: float = 0.5, limit: int = 20
     ) -> list[dict]:
         """국세청 질의회신(유권해석) 전문검색."""
-        return self.client.execute_query(
+        literal = query.strip()
+        if (sum(char.isalnum() for char in literal) < 2
+                or re.fullmatch(r"(?:AND|OR|NOT)(?:\s+(?:AND|OR|NOT))*", literal, re.I)):
+            literal = ""
+        rows = self.client.execute_query(
             cq.FULLTEXT_SEARCH_INTERPRETATIONS,
-            {"query": _literal_fulltext_query(query), "min_score": min_score, "limit": limit},
+            {"query": _literal_fulltext_query(query), "literal_query": literal,
+             "min_score": min_score, "limit": limit},
         )
+        # A sparsely populated derivative field has a different Lucene score
+        # scale. Preserve the ordinary threshold, allowing an exact phrase in
+        # a currently hash-bound transcription only after its pins validate.
+        return [{**row, "interpretation": _interpretation_evidence(row["interpretation"])}
+                for row in rows if not catalogue_metadata_only(row["interpretation"])
+                and (row.get("score", min_score + 1) > min_score or (
+                    literal and image_transcription_matches(row["interpretation"], literal)))]
 
     def fulltext_search_tribunals(
         self, query: str, min_score: float = 0.5, limit: int = 20

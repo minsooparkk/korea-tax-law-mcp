@@ -40,14 +40,21 @@ REPO = os.path.dirname(SCRIPT_DIR)
 if os.path.isdir(os.path.join(REPO, "src")):
     sys.path.insert(0, REPO)
 
+from src.search.graph_searcher import (
+    annex_body,
+    original_attachment_url,
+    source_date_notice,
+    source_observation_notice,
+)
 from src.search.public_search import BODY_FIELDS, INTENT_TYPES, NODE_TYPES, PublicGraphSearch
+from src.search.source_quality import interpretation_body_guard
 
 LOG_DIR = os.environ.get("MCP_LOG_DIR") or os.path.join(REPO, "logs", "mcp")
 BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.8.1"
+SERVER_VERSION = "0.9.1"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -79,6 +86,7 @@ INSTRUCTIONS = (
     "resolved_version_id가 없거나 시점이 unresolved이면 현행 조문 적용을 단정하지 마세요. "
     "세율·기준금액이 별표에 위임된 경우가 많으니 get_article이 별표를 가리키면 get_annex로 확인하고, "
     "미래 과세기간이 걸린 질문은 list_upcoming으로 시행예정 개정을 확인하세요. "
+    "초안의 해석례·판례 문서번호와 조문 인용이 실제로 있는지는 verify_citations로 확인하세요. "
     "수록 법령 목록은 list_laws로, 조세조약 체결국은 list_treaties로 확인하세요"
     "(미수록 법령은 국가법령정보센터 law.go.kr 참조). "
     "목록의 역사 법령은 현행 그래프에서 제외됩니다. "
@@ -427,14 +435,15 @@ Q_ARTICLE_ANNEX = (
 )
 
 Q_SEARCH_ANNEXES = (
-    "CALL db.index.fulltext.queryNodes('annex_content_ft', $q) YIELD node, score "
+    "CALL db.index.fulltext.queryNodes('annex_original_content_ft_v2', $q) YIELD node, score "
     "MATCH (l:Law {law_id: node.law_id}) "
     f"WHERE {current_scoped_annex_guard(law='l', annex='node')} "
     "AND ($law IS NULL OR l.law_name CONTAINS $law) "
     f"AND {scoped_annex_owner_exists(law='l', annex='node')} "
     "RETURN l.law_name AS law, node.annex_number AS no, node.annex_title AS title, "
     "node.annex_type AS kind, size(coalesce(node.content, '')) AS len, "
-    "substring(coalesce(node.content, ''), 0, 240) AS preview, score "
+    "substring(coalesce(node.content, ''), 0, 240) AS preview, "
+    "node {.content, .source_snapshot, .extracted_content, .extracted_content_sha256, .original_binary_sha256, .extraction_source_snapshot, .extraction_provenance} AS source_body, score "
     "ORDER BY score DESC LIMIT $limit"
 )
 
@@ -449,7 +458,8 @@ Q_GET_ANNEX = (
     f"AND {scoped_annex_owner_exists(law='l', annex='x')} "
     "RETURN l.law_name AS law, x.annex_number AS no, x.annex_title AS title, "
     "x.content AS content, x.hwp_url AS hwp, x.pdf_url AS pdf, "
-    "x.related_articles AS arts "
+    "x.related_articles AS arts, "
+    "x {.content, .source_snapshot, .extracted_content, .extracted_content_sha256, .original_binary_sha256, .extraction_source_snapshot, .extraction_provenance} AS source_body "
     "ORDER BY CASE WHEN l.law_name = $law THEN 0 ELSE 1 END "
     "LIMIT 1"
 )
@@ -472,6 +482,7 @@ Q_VERIFIED_CITATIONS = (
     "CALL (a) { "
     "MATCH (a)-[rel:HAS_CASE]->(c:Case) "
     f"WHERE {document_citation_guard(document='c', article='a', edge='rel')} "
+    "AND coalesce(c.body_identity_status, '') <> 'unresolved' "
     "RETURN 'case' AS kind, coalesce(c.court_type, '판례') AS org, "
     "c.case_number AS no, c.ruling_date AS d, "
     "rel.temporal_resolution AS tr, rel.resolved_version_id AS vid "
@@ -479,6 +490,7 @@ Q_VERIFIED_CITATIONS = (
     "UNION ALL "
     "MATCH (a)-[rel:HAS_INTERPRETATION]->(i:Interpretation) "
     f"WHERE {document_citation_guard(document='i', article='a', edge='rel')} "
+    f"AND {interpretation_body_guard('i')} "
     "RETURN 'interpretation' AS kind, coalesce(i.reply_org, '해석례') AS org, "
     "i.interp_number AS no, i.reply_date AS d, "
     "rel.temporal_resolution AS tr, rel.resolved_version_id AS vid "
@@ -729,9 +741,16 @@ def t_search_cases(args: dict) -> str:
     q = lucene_escape(str(args["query"]))
     limit = min(int(args.get("limit", 5)), 15)
     rows = cypher(
-        "CALL db.index.fulltext.queryNodes('case_content_ft', $q) YIELD node, score "
+        "CALL db.index.fulltext.queryNodes('case_original_content_ft_v2', $q) YIELD node, score "
+        "WHERE coalesce(node.body_identity_status, '') <> 'unresolved' "
         "RETURN node.case_number AS no, node.case_name AS name, node.court_type AS court, "
-        "node.ruling_date AS d, "
+        "node.ruling_date AS d, node.case_id AS case_id, node.source_kind AS source_kind, "
+        "node.body_status AS body_status, node.identity_status AS identity_status, "
+        "node.original_attachment_available AS original_attachment_available, "
+        "node.date_status AS date_status, node.listing_date AS listing_date, "
+        "node.listed_decision_date AS listed_decision_date, node.original_document_date AS original_document_date, "
+        "node.document_decision_date AS document_decision_date, "
+        
         "substring(coalesce(node.case_holding, node.ruling_summary, node.full_content, ''), 0, 320) AS preview, "
         "score ORDER BY score DESC LIMIT $limit",
         {"q": q, "limit": limit},
@@ -743,6 +762,14 @@ def t_search_cases(args: dict) -> str:
         out.append(
             f"[{r['court'] or '판례'}] {r['no']} {r['name'] or ''} ({fmt_date(r['d'])})\n  {clip(r['preview'], 320)}"
         )
+        if notice := source_date_notice(r):
+            out.append("[원천 날짜 정보 · 원문 아님] " + notice)
+        if r.get("body_status") == "attachment_only":
+            out.append("[자료 상태] 공식 첨부 원본을 확보했으며 전문 추출은 완료되지 않았습니다.")
+        elif r.get("body_status") == "summary_only":
+            out.append("[자료 상태] 공식 요지만 확보된 자료입니다.")
+        if attachment := original_attachment_url(r):
+            out.append("공식 원문 첨부: " + attachment)
     out.append(
         "\n※ 요지 발췌임. 키워드 검색은 본문 일치이며 현행 조문에 대한 검증된 인용이 아니다. "
         "조문 연결은 get_article의 검증된 인용만 쓴다. 인용 시 사건번호로 원문 확인 요망."
@@ -750,28 +777,249 @@ def t_search_cases(args: dict) -> str:
     return "\n\n".join(out)
 
 
-def t_search_interpretations(args: dict) -> str:
-    q = lucene_escape(str(args["query"]))
-    limit = min(int(args.get("limit", 5)), 15)
+# ---------------------------------------------------------------- 해석례 순위·문서번호 조회
+# 전문검색 인덱스는 standard 분석기라 '출자공동사업자의'와 '출자공동사업자', '적용여부'와 '적용 여부'를
+# 다른 낱말로 본다. 해석례는 제목이 곧 쟁점이라, 본문 점수만으로는 짧은 회신(기재부 등)이 긴 본문에 밀린다.
+# 그래서 (1) 본문 점수, (2) 조사를 뗀 핵심어가 제목에 몇 개 있는지, (3) 질문과 제목·요지의 글자 2-gram 겹침을
+# 같은 비중으로 더해 후보를 다시 줄 세운다. 후보는 본문 검색과 제목 핵심어 검색에서 모은다.
+
+_KO_TAIL = re.compile(
+    r"(으로서|으로써|에게서|으로|에서|에게|로서|로써|까지|부터|이나|이며|이고|하는|되는|하여|해야|"
+    r"의|가|이|은|는|을|를|에|와|과|로|도|만)$"
+)
+_STEM_STOP = {"여부", "경우", "해당", "관련", "대한", "있는지", "되는지", "하는지", "따른", "위한", "적용",
+              "등", "및", "그", "수", "것", "때", "어떻게", "있나요", "되나요", "하나요"}
+INTERP_POOL = 40
+
+
+def ko_stems(q: str, k: int = 8) -> list[str]:
+    out = []
+    for w in re.findall(r"[가-힣A-Za-z0-9]+", q or ""):
+        if len(w) > 2:
+            w = _KO_TAIL.sub("", w)
+        w = w.lower()
+        if len(w) >= 2 and w not in _STEM_STOP and w not in out:
+            out.append(w)
+    return out[:k]
+
+
+def _bigrams(t: str) -> set:
+    t = re.sub(r"[^0-9A-Za-z가-힣]", "", t or "")
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def bigram_sim(q: str, t: str) -> float:
+    qb, tb = _bigrams(q), _bigrams(t)
+    return len(qb & tb) / ((len(qb) * len(tb)) ** 0.5) if qb and tb else 0.0
+
+
+def doc_key(s: str) -> str:
+    """문서번호 비교용 — 날짜 괄호·공백·기호를 떼고 숫자 앞 0을 없앤다('서면-2023-법규기본-0950' = '서면2023법규기본950')."""
+    s = re.sub(r"\(\d{4}\.[^)]*\)", "", s or "")
+    return re.sub(r"(?<!\d)0+(?=\d)", "", re.sub(r"[^0-9A-Za-z가-힣]", "", s))
+
+
+def interp_number_keys(no: str) -> list[str]:
+    """DB 문서번호 '서면-2023-법규기본-2595[법규과-2973]'은 본번호·괄호 안 부번호 어느 쪽으로도 찾는다."""
+    main, _, rest = (no or "").partition("[")
+    keys = [doc_key(main)]
+    if rest:
+        keys.append(doc_key(rest.rstrip("]")))
+    return [k for k in keys if k]
+
+
+# 해석례·결정례 문서번호 표기. 조문 번호(제52조)·금액과 섞이지 않게 기관·형식 표지가 있는 것만.
+INTERP_NO_RE = re.compile(
+    r"(?:서면|사전|기준|질의)\s*-?\s*\d{4}\s*-\s*[가-힣]{1,12}\s*-\s*\d{1,5}(?:\s*\[[^\]]{1,40}\])?"
+    r"|(?:기획재정부|재정경제부|재경부|기재부)?\s?[가-힣]{2,14}(?:과|팀|국|관|실)\s?-\s?\d{1,6}"
+    r"|[가-힣]{1,6}\d{5}-\d{1,6}"
+)
+CASE_NO_RE = re.compile(
+    r"조심\s*-?\s*\d{4}\s*-?\s*[가-힣]{1,2}\s*-?\s*\d{1,6}"
+    r"|국심\s*-?\s*\d{4}\s*-?\s*[가-힣]{1,2}\s*-?\s*\d{1,6}"
+    r"|(?:심사|이의|적부)-[가-힣]{1,4}-\d{4}-\d{1,5}"
+    r"|감사원-\d{4}-감심-\d{1,5}"
+    r"|(?<![\d-])\d{4}\s?(?:헌[가-힣]{1,2}|구합|구단|두|누|다|나|도|노|구|마|카합)\s?\d{1,6}"
+)
+
+
+def _serial(no: str) -> str:
+    m = re.search(r"(\d+)\D*$", no or "")
+    return str(int(m.group(1))) if m else ""
+
+
+def _number_tokens(no: str) -> list[str]:
+    """후보를 좁힐 부분 문자열 — 한글 덩어리와 끝 일련번호(앞 0 제거). 일련번호만으로는 '-8'·'-0020'처럼 짧아 후보가 넘친다.
+    연도는 넣지 않는다 — 원천 표기가 '사전-202-3법규부가0594'처럼 깨진 번호가 있어, 최종 일치는 doc_key로 가린다."""
+    s = re.sub(r"^(?:기재부|재경부)", "", no.strip())
+    toks = re.findall(r"[가-힣]+", s) + ([_serial(s)] if _serial(s) else [])
+    return [t for t in dict.fromkeys(toks) if t] or [no]
+
+
+def lookup_interp_numbers(no: str) -> list[dict]:
+    """문서번호 정확 조회. 사용자 표기의 정규형이 DB 본번호·부번호와 같거나, 기관명을 앞에 붙였을 때 같으면 일치."""
+    want = doc_key(re.sub(r"^(?:기재부|재경부)", "", no.strip()))
+    serial = _serial(no)
+    if len(want) < 5 or not serial:
+        return []
+    # 화면 번호(interp_number)가 다른 출처 번호일 때가 있어 국세청 공식 번호·부서 문서번호로도 찾는다
+    # (예: interp_number 서면-2023-법규기본-2595 ↔ 국세청 서면-2024-법규기본-3219, 같은 원문)
     rows = cypher(
-        "CALL db.index.fulltext.queryNodes('interp_content_ft', $q) YIELD node, score "
-        "RETURN node.interp_title AS title, node.interp_number AS no, node.reply_date AS d, "
-        "node.reply_org AS org, substring(coalesce(node.content, ''), 0, 320) AS preview, score "
+        "MATCH (i:Interpretation) "
+        "WITH i, coalesce(i.interp_number, '') + ' ' + coalesce(i.source_doc_number, '') + ' ' + coalesce(i.department_doc_number, '') AS s "
+        "WHERE all(t IN $toks WHERE s CONTAINS t) "
+        "RETURN i.interp_id AS id, i.interp_number AS no, i.interp_title AS title, i.reply_date AS d, "
+        "i.reply_org AS org, i.source_doc_number AS src, i.department_doc_number AS dep LIMIT 3000",
+        {"toks": _number_tokens(no)},
+    )
+    hits = []
+    for r in rows:
+        keys = interp_number_keys(r.get("no") or "") + [doc_key(re.sub(r"\[.*$", "", x)) for x in (r.get("src"), r.get("dep")) if x]
+        if any(k == want or (k.endswith(want) and re.match(r"[가-힣]", want)
+                             and k[: len(k) - len(want)] in ("기획재정부", "재정경제부"))
+               for k in keys):
+            hits.append(r)
+    return hits
+
+
+def lookup_case_numbers(no: str) -> list[dict]:
+    want = doc_key(no)
+    serial = _serial(no)
+    if len(want) < 5 or not serial:
+        return []
+    rows = cypher(
+        "MATCH (c:Case) WHERE all(t IN $toks WHERE c.case_number CONTAINS t) "
+        "RETURN c.case_id AS id, c.case_number AS no, c.case_name AS title, c.ruling_date AS d, "
+        "coalesce(c.court_name, c.court_type) AS org LIMIT 3000",
+        {"toks": _number_tokens(no)},
+    )
+    seen, hits = set(), []
+    for r in rows:
+        if doc_key(r.get("no") or "") == want and (r["no"], r.get("d")) not in seen:
+            seen.add((r["no"], r.get("d")))
+            hits.append(r)
+    return hits
+
+
+def _interp_rows(q: str, limit: int) -> list[dict]:
+    return cypher(
+        "CALL db.index.fulltext.queryNodes('interp_original_content_ft_v3', $q) YIELD node, score "
+        f"WHERE {interpretation_body_guard('node')} "
+        "RETURN node.interp_id AS id, node.interp_title AS title, node.interp_number AS no, node.reply_date AS d, "
+        "node.reply_org AS org, node.source_doc_number AS src, substring(coalesce(node.content, ''), 0, 320) AS preview, "
+        "node.maintenance_notice AS maintenance_notice, node.body_status AS body_status, "
+        "node {.source_observed_at, .source_kind, .source_id, .latest_source_observation_status, .latest_source_observation_kind, "
+        ".latest_source_observation_at, .latest_source_observation_raw_sha256, .latest_source_observation_url} AS source_observation, score "
         "ORDER BY score DESC LIMIT $limit",
         {"q": q, "limit": limit},
     )
+
+
+def rank_interpretations(query: str, limit: int) -> list[dict]:
+    """본문 점수·제목 핵심어·2-gram 겹침을 1/3씩. 각 항목은 0~1로 맞춘다."""
+    body = _interp_rows(lucene_escape(query), INTERP_POOL)
+    stems = ko_stems(query)
+    title = _interp_rows("interp_title:(" + " ".join(s + "*" for s in stems) + ")", INTERP_POOL) if stems else []
+    pool: dict = {}
+    top = max((r["score"] for r in body), default=0) or 1
+    for r in body:
+        pool[r["id"]] = {**r, "_body": r["score"] / top, "_title": 0.0}
+    for r in title:
+        pool.setdefault(r["id"], {**r, "_body": 0.0})["_title"] = min(1.0, r["score"] / len(stems))
+    for r in pool.values():
+        if "_title" not in r:
+            r["_title"] = 0.0
+        r["_sim"] = bigram_sim(query, (r.get("title") or "") + " " + (r.get("preview") or "")[:200])
+        r["_rank"] = (r["_body"] + r["_title"] + r["_sim"]) / 3
+    return sorted(pool.values(), key=lambda r: r["_rank"], reverse=True)[:limit]
+
+
+def t_search_interpretations(args: dict) -> str:
+    query = str(args["query"])
+    limit = min(int(args.get("limit", 5)), 15)
+    found = {no: lookup_interp_numbers(no) for no in dict.fromkeys(x.group(0) for x in INTERP_NO_RE.finditer(query))}
+    exact = [m for hits in found.values() for m in hits]
+    missing = [no for no, hits in found.items() if not hits]
+    rows = rank_interpretations(query, limit)
+    if exact:
+        ids = {e["id"] for e in exact}
+        rows = [r for r in rows if r["id"] not in ids]
+        head = cypher(
+            f"MATCH (node:Interpretation) WHERE node.interp_id IN $ids AND {interpretation_body_guard('node')} "
+            "RETURN true AS exact, node.interp_id AS id, node.interp_title AS title, node.interp_number AS no, node.reply_date AS d, "
+            "node.reply_org AS org, node.source_doc_number AS src, substring(coalesce(node.content, ''), 0, 320) AS preview, "
+            "node.maintenance_notice AS maintenance_notice, node.body_status AS body_status, "
+            "node {.source_observed_at, .source_kind, .source_id, .latest_source_observation_status, .latest_source_observation_kind, "
+            ".latest_source_observation_at, .latest_source_observation_raw_sha256, .latest_source_observation_url} AS source_observation",
+            {"ids": list(ids)},
+        )
+        rows = (head + rows)[:limit]
     if not rows:
         return "검색 결과 없음. 단일 핵심 키워드로 다시 시도해 보세요."
     out = []
+    if missing:
+        out.append("[문서번호 미확인] " + ", ".join(missing) + ": 이 DB에서 같은 번호를 찾지 못했습니다. "
+                   "번호 오기이거나 미수록 문서일 수 있어, 아래 결과는 그 문서가 아닙니다.")
     for r in rows:
         head = " ".join(x for x in [r.get("org"), r.get("no"), f"({fmt_date(r.get('d'))})" if r.get("d") else ""] if x)
-        out.append(f"[{head}] {r['title'] or ''}\n  {clip(r['preview'], 320)}")
+        mark = "[문서번호 일치] " if r.get("exact") else ""
+        out.append(f"{mark}[{head}] {r['title'] or ''}\n  {clip(r['preview'], 320)}")
+        if r.get("src") and doc_key(re.sub(r"\[.*$", "", r["src"])) not in interp_number_keys(r.get("no") or ""):
+            out.append(f"[국세청 공식 번호] {r['src']}. 같은 문서가 출처에 따라 다른 번호로 실려 있습니다.")
+        if r.get("maintenance_notice"):
+            out.append(r["maintenance_notice"])
+        if notice := source_observation_notice(r.get("source_observation") or r):
+            out.append("[최근 원천 확인 상태] " + notice)
+        if r.get("body_status") == "partial_extraction":
+            out.append("[자료 상태] 원문 그림·수식·표의 구조 완전성은 확인되지 않았으며 원본 확인이 필요합니다.")
+        if r.get("body_status") == "reply_complete":
+            out.append("[자료 범위] 공식 회신 원문을 확보한 자료입니다.")
+        if r.get("body_status") in {"empty", "summary_only", "attachment_only", "source_empty", "unknown"}:
+            out.append("[자료 상태] 원문 전문 확보가 완료되지 않은 자료입니다. 제공된 요지·회신의 범위를 확인하세요.")
     out.append(
         "\n※ 해석례는 개별 사실관계 전제임. 키워드 검색은 본문 일치이며 "
         "현행 조문에 대한 검증된 인용이 아니다. 문서번호로 원문 확인 요망."
     )
     return "\n\n".join(out)
 
+
+
+LAWREF_RE = re.compile(
+    r"((?:[가-힣]+에\s?관한\s?법률|(?:[가-힣]+\s및\s)?[가-힣]*?[가-힣]법)(?:\s?시행령|\s?시행규칙)?)\s*(제\s?\d+\s?조(?:\s?의\s?\d+)?)"
+)
+
+
+def t_verify_citations(args: dict) -> dict:
+    """초안에 적힌 해석례·판례·결정례 문서번호와 '법령명 제N조'가 이 DB에 실제로 있는지 확인한다."""
+    text = str(args.get("text") or "")[:20000]
+    docs = []
+    for m in dict.fromkeys(x.group(0).strip() for x in INTERP_NO_RE.finditer(text)):
+        hits = lookup_interp_numbers(m)
+        docs.append({"citation": m, "kind": "interpretation", "status": "found" if hits else "not_found",
+                     "matches": [{"number": h["no"], **({"official_number": h["src"]} if h.get("src") and doc_key(h["src"]) not in interp_number_keys(h["no"]) else {}),
+                                  "title": h.get("title"), "date": fmt_date(h.get("d")), "org": h.get("org")}
+                                 for h in hits[:3]]})
+    for m in dict.fromkeys(x.group(0).strip() for x in CASE_NO_RE.finditer(text)):
+        hits = lookup_case_numbers(m)
+        docs.append({"citation": m, "kind": "case", "status": "found" if hits else "not_found",
+                     "matches": [{"number": h["no"], "title": h.get("title"), "date": fmt_date(h.get("d")), "court": h.get("org")}
+                                 for h in hits[:3]]})
+    arts = []
+    for law, no in dict.fromkeys((a.strip(), re.sub(r"\s", "", b)) for a, b in LAWREF_RE.findall(text)):
+        rows = cypher(q_current_article("replace(l.law_name, ' ', '') = $law"), {"law": re.sub(r"\s", "", law), "no": norm_article_no(no)})
+        arts.append({"citation": f"{law} {no}", "status": "found" if rows else "not_found",
+                     **({"law": rows[0]["law"], "title": rows[0]["title"], "enforcement_date": fmt_date(rows[0]["enf"])} if rows else {})})
+    docs, arts = docs[:40], arts[:40]
+    bad = [d["citation"] for d in docs + arts if d["status"] != "found"]
+    return {
+        "documents": docs,
+        "articles": arts,
+        "summary": f"문서번호 {len(docs)}건 · 조문 {len(arts)}건 중 이 DB에서 확인 안 된 것 {len(bad)}건",
+        "not_found": bad,
+        "notice": ("found는 같은 번호의 문서·현행 조문이 있다는 뜻일 뿐, 인용한 내용이 그 문서·조문과 맞는지는 "
+                   "get_evidence·get_article로 본문을 확인해야 한다. not_found는 지어낸 번호일 수도, 이 DB 미수록일 수도 있다"
+                   "(형사·민사 판결, 최근 공개분, 폐지·이동 조문). 조문은 현행 버전 기준이다."),
+    }
 
 
 # ---------------------------------------------------------------- 별표·시행예정
@@ -788,9 +1036,11 @@ def t_search_annexes(args: dict) -> str:
         )
     out = []
     for r in rows:
-        out.append(
-            f"[{r['law']} {r['no']}] {r['title']} ({r['len']:,}자)\n  {clip(r['preview'], 240)}"
-        )
+        body, representation = annex_body(r.get("source_body") or {"content": r.get("preview")})
+        length = len(body) if representation == "extracted_attachment" else r["len"]
+        out.append(f"[{r['law']} {r['no']}] {r['title']} ({length:,}자)\n  {clip(body, 240)}")
+        if representation == "extracted_attachment":
+            out.append("[첨부 추출정보 · 원문 아님] 공식 첨부 추출문이며 표의 행·열 구조는 미검증입니다.")
     out.append('\n※ 본문 전체는 get_annex(law_name, annex_number="별표 N")로 조회.')
     return "\n\n".join(out)
 
@@ -808,8 +1058,10 @@ def t_get_annex(args: dict) -> str:
             return f"'{law} {no}'를 찾지 못함. 수록 별표·서식:\n{listing}"
         return f"'{law}'의 별표가 DB에 없음. list_laws로 법령명을 확인하세요."
     r = rows[0]
-    body = r["content"] or ""
+    body, representation = annex_body(r.get("source_body") or {"content": r.get("content")})
     out = [f"# {r['law']} [{r['no']}] {r['title']}"]
+    if representation == "extracted_attachment":
+        out.append("[첨부 추출정보 · 원문 아님] 공식 첨부 추출문이며 표의 행·열 구조는 미검증입니다.")
     if r["arts"]:
         out.append(f"근거 조문: {', '.join(r['arts'])}")
     out.append("")
@@ -952,7 +1204,7 @@ def t_search_treaties(args: dict) -> str:
     rows = cypher(
         "CALL db.index.fulltext.queryNodes('treaty_article_ft', $q) YIELD node, score "
         "WHERE ($c IS NULL OR node.country CONTAINS $c) "
-        "RETURN node.country AS c, node.article_number AS no, node.article_title AS title, "
+        "RETURN node.is_whole_document AS is_whole_document, node.country AS c, node.article_number AS no, node.article_title AS title, "
         "substring(coalesce(node.content, node.content_en, ''), 0, 320) AS preview, score "
         "ORDER BY score DESC LIMIT $limit",
         {"q": q, "c": country, "limit": limit},
@@ -967,6 +1219,8 @@ def t_search_treaties(args: dict) -> str:
         out.append(
             f"[{r['c']} 조세조약 {r['no']}] {r['title'] or ''}\n  {clip(r['preview'], 320)}"
         )
+        if r.get("is_whole_document"):
+            out.append("[문서 범위 · 원문 아님] 조약 원문 문서 전체이며 개별 조항 또는 개정 반영 통합본이 아닙니다.")
     out.append(
         "\n※ 조문 전문은 get_treaty_article(country, article_number)로 조회. "
         "본문에 개정의정서가 반영되지 않았을 수 있으니 "
@@ -1018,7 +1272,8 @@ def t_get_treaty_article(args: dict) -> str:
         "WHERE a.country CONTAINS $c AND a.article_number = $no "
         "AND coalesce(a.is_annex, false) = false "
         "RETURN a.treaty_article_id AS aid, a.country AS c, a.article_title AS title, "
-        "a.content AS kr, a.content_en AS en, t.treaty_url AS url, t.treaty_name AS tname "
+        "a.content AS kr, a.content_en AS en, coalesce(a.source_url, t.treaty_url) AS url, t.treaty_name AS tname, "
+        "a.is_whole_document AS is_whole_document "
         "LIMIT 1",
         {"c": country, "no": no},
     )
@@ -1065,6 +1320,8 @@ def t_get_treaty_article(args: dict) -> str:
         "",
         (r["kr"] or "").strip() or "(국문본 없음)",
     ]
+    if r.get("is_whole_document"):
+        out.insert(1, "[문서 범위 · 원문 아님] 조약 원문 문서 전체이며 개별 조항 또는 개정 반영 통합본이 아닙니다.")
     en = (r["en"] or "").strip()
     if en:
         out += ["", "## 영문본", en[:4000] + ("…" if len(en) > 4000 else "")]
@@ -1088,7 +1345,8 @@ def t_get_treaty_article(args: dict) -> str:
             )
 
     recs = _treaty_records(r["c"])
-    out.append(f"\n## 본문 출처\n국세법령정보시스템 조세조약 본문 — 수록 조약: {r['tname']}")
+    origin = "국가법령정보센터 공식 조약 원문 문서" if r.get("is_whole_document") else "국세법령정보시스템 조세조약 본문"
+    out.append(f"\n## 본문 출처\n{origin} — 수록 조약: {r['tname']}")
     if len(recs) > 1:
         out.append("\n## 해당국 협약·의정서 이력")
         for x in recs:
@@ -1177,7 +1435,7 @@ TOOLS = [
     },
     {
         "name": "search_interpretations",
-        "description": "국세청 질의회신·법제처·행정안전부 해석례를 전문검색한다. 실무 쟁점의 과세관청 입장 확인에 사용. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
+        "description": "국세청 질의회신·법제처·행정안전부 해석례를 전문검색한다. 실무 쟁점의 과세관청 입장 확인에 사용. 쟁점 문장을 그대로 넣어도 되고, 문서번호를 넣으면 그 문서를 맨 앞에 준다. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1188,6 +1446,17 @@ TOOLS = [
             "additionalProperties": False,
         },
         "fn": t_search_interpretations,
+    },
+    {
+        "name": "verify_citations",
+        "description": "답변·의견서 초안에 적힌 해석례·판례·결정례 문서번호(예: 서면-2023-법규기본-2595, 기획재정부 소득세제과-1059, 2015두41937, 조심2023서1234)와 '법령명 제N조' 인용이 이 DB에 실제로 있는지 확인한다. 지어낸 번호·없는 조문을 거르는 용도이며, 존재 확인일 뿐 내용 일치 확인이 아니다.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "검증할 초안 본문 또는 문서번호 목록"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "fn": t_verify_citations,
     },
     {
         "name": "search_annexes",
@@ -1352,16 +1621,78 @@ def rate_ok(ip: str, bucket: str = "call", limit: int = RATE_PER_MIN) -> bool:
 _log_lock = threading.Lock()
 
 
-def log_usage(ip: str, method: str, tool: str, ms: int, status: str):
+def log_usage(ip: str, method: str, tool: str, ms: int, status: str, ua: str = "", client: str = ""):
+    """ua는 요청 헤더, client는 initialize의 clientInfo(이름/버전) — 어떤 프로그램으로 붙는지 보려고."""
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         rec = {
             "ts": datetime.now().isoformat(timespec="seconds"),  # noqa: DTZ005 - Preserve local log timestamps.
             "ip": ip, "method": method, "tool": tool, "ms": ms, "status": status,
         }
+        if ua:
+            rec["ua"] = ua[:120]
+        if client:
+            rec["client"] = client[:80]
         path = os.path.join(LOG_DIR, f"usage-{datetime.now():%Y%m%d}.jsonl")  # noqa: DTZ005 - Local daily buckets.
         with _log_lock, open(path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+# 질의 기록 — 무엇을 찾는지 분류하려고 도구 인자 중 검색어·법령·조문만 남긴다.
+# 이메일·전화·주민번호·긴 숫자는 쓰기 전에 가리고, 파일은 QUERY_RETENTION_DAYS 뒤 지운다.
+QUERY_RETENTION_DAYS = 30
+QUERY_ARG_KEYS = ("query", "law_name", "article_number", "annex_number", "country", "as_of", "evidence_type", "search_intents")
+_MASKS = (
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "[이메일]"),
+    (re.compile(r"\d{6}\s*-\s*[1-8]\d{6}"), "[주민번호]"),
+    (re.compile(r"01[016789][\s-]?\d{3,4}[\s-]?\d{4}"), "[전화]"),
+    (re.compile(r"\d[\d,.-]{6,}\d"), "[숫자]"),
+)
+_query_purged = {"day": ""}
+
+
+def mask_text(value) -> str:
+    text = str(value)[:300]
+    for pattern, repl in _MASKS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def query_args(args: dict) -> dict:
+    out = {}
+    for key in QUERY_ARG_KEYS:
+        value = args.get(key)
+        if value in (None, "", {}, []):
+            continue
+        if key == "search_intents" and isinstance(value, dict):
+            out[key] = {str(k)[:20]: [mask_text(v) for v in (vs if isinstance(vs, list) else [vs])[:3]] for k, vs in list(value.items())[:8]}
+        else:
+            out[key] = mask_text(value)
+    return out
+
+
+def log_query(ip: str, tool: str, args: dict, status: str, ua: str = ""):
+    try:
+        rec_args = query_args(args if isinstance(args, dict) else {})
+        if not rec_args:
+            return
+        os.makedirs(LOG_DIR, exist_ok=True)
+        now = datetime.now()  # noqa: DTZ005 - Local daily buckets like usage logs.
+        day = f"{now:%Y%m%d}"
+        rec = {"ts": now.isoformat(timespec="seconds"), "ip": ip, "tool": tool, "status": status, "args": rec_args}
+        if ua:
+            rec["ua"] = ua[:120]
+        with _log_lock:
+            if _query_purged["day"] != day:
+                _query_purged["day"] = day
+                cutoff = f"{datetime.fromtimestamp(now.timestamp() - QUERY_RETENTION_DAYS * 86400):%Y%m%d}"  # noqa: DTZ006
+                for name in os.listdir(LOG_DIR):
+                    if name.startswith("queries-") and name.endswith(".jsonl") and name[8:16] < cutoff:
+                        os.remove(os.path.join(LOG_DIR, name))
+            with open(os.path.join(LOG_DIR, f"queries-{day}.jsonl"), "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
 
@@ -1372,7 +1703,7 @@ def rpc_error(id_, code, message):
     return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
 
 
-def handle_message(msg: dict, ip: str):
+def handle_message(msg: dict, ip: str, ua: str = ""):
     """JSON-RPC 메시지 처리. 응답 dict 반환, 알림(id 없음)이면 None."""
     method = msg.get("method", "")
     id_ = msg.get("id")
@@ -1383,13 +1714,15 @@ def handle_message(msg: dict, ip: str):
     if method in ("initialize", "tools/list") and not rate_ok(
         ip, "handshake", HANDSHAKE_PER_MIN
     ):
-        log_usage(ip, method, "", 0, "rate_limited")
+        log_usage(ip, method, "", 0, "rate_limited", ua)
         return rpc_error(id_, -32000, "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요.")
 
     if method == "initialize":
         client_proto = str(params.get("protocolVersion", DEFAULT_PROTOCOL))
         proto = client_proto if client_proto in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
-        log_usage(ip, "initialize", "", 0, "ok")
+        info = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
+        client = "/".join(str(info.get(k) or "").strip()[:40] for k in ("name", "version")).strip("/")
+        log_usage(ip, "initialize", "", 0, "ok", ua, client)
         return {
             "jsonrpc": "2.0", "id": id_,
             "result": {
@@ -1406,7 +1739,7 @@ def handle_message(msg: dict, ip: str):
 
     if method == "tools/list":
         tools = [{k: t[k] for k in ("name", "description", "inputSchema", "outputSchema", "annotations") if k in t} for t in TOOLS]
-        log_usage(ip, "tools/list", "", 0, "ok")
+        log_usage(ip, "tools/list", "", 0, "ok", ua)
         return {"jsonrpc": "2.0", "id": id_, "result": {"tools": tools}}
 
     if method == "tools/call":
@@ -1416,7 +1749,7 @@ def handle_message(msg: dict, ip: str):
         if not tool:
             return rpc_error(id_, -32602, f"알 수 없는 도구: {name}")
         if not rate_ok(ip):
-            log_usage(ip, "tools/call", name, 0, "rate_limited")
+            log_usage(ip, "tools/call", name, 0, "rate_limited", ua)
             return {
                 "jsonrpc": "2.0", "id": id_,
                 "result": {"content": [{"type": "text",
@@ -1440,7 +1773,8 @@ def handle_message(msg: dict, ip: str):
             text, status, is_err = "DB 연결 실패. 잠시 후 다시 시도해 주세요.", "db_down", True
         except Exception as e:  # noqa: BLE001 - Serialize unexpected tool errors at the MCP boundary.
             text, status, is_err = f"조회 실패: {type(e).__name__}", "error", True
-        log_usage(ip, "tools/call", name, int((time.time() - t0) * 1000), status)
+        log_usage(ip, "tools/call", name, int((time.time() - t0) * 1000), status, ua)
+        log_query(ip, name, params.get("arguments") or {}, status, ua)
         result = {"content": [{"type": "text", "text": text}], "isError": is_err}
         if isinstance(output, dict) and not is_err:
             result["structuredContent"] = output
@@ -1564,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
         msg = self._read_rpc()
         if msg is None:
             return
-        resp = handle_message(msg, ip)
+        resp = handle_message(msg, ip, self.headers.get("User-Agent", ""))
         if resp is None:  # 알림
             self.send_empty(202)
         elif self._wants_sse():
@@ -1635,7 +1969,7 @@ class Handler(BaseHTTPRequestHandler):
         msg = self._read_rpc()
         if msg is None:
             return
-        resp = handle_message(msg, ip)
+        resp = handle_message(msg, ip, self.headers.get("User-Agent", ""))
         if resp is not None:
             q.put(resp)
         self.send_empty(202)

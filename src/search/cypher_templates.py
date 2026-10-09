@@ -12,6 +12,12 @@ from src.search.edge_provenance import (
     document_citation_guard,
 )
 from src.search.evidence_identity import verified_version_guard
+from src.search.source_quality import interpretation_body_guard
+
+
+def case_body_identity_guard(node: str) -> str:
+    return f"coalesce({node}.body_identity_status, '') <> 'unresolved'"
+
 
 # Aliases match the per-template node/rel names so guards interpolate as-is.
 _DELEGATES_TO_RELS = delegates_to_rel_guard(rel="rel")
@@ -20,17 +26,21 @@ _PATH_NODES = current_path_nodes_guard(nodes="nodes(path)")
 _CURRENT_A = current_article_guard(node="a")
 _CURRENT_REF = current_article_guard(node="ref")
 _CURRENT_SOURCE = current_article_guard(node="source")
-_DOC_CASE = document_citation_guard(document="c", article="a", edge="rel")
+_DOC_CASE = (document_citation_guard(document="c", article="a", edge="rel")
+             + " AND " + case_body_identity_guard("c"))
 _DOC_RULING = document_citation_guard(document="r", article="a", edge="rel")
-_DOC_INTERP = document_citation_guard(document="i", article="a", edge="rel")
-_DOC_CASE_SOURCE = document_citation_guard(document="cas", article="source", edge="rel")
+_DOC_INTERP = (document_citation_guard(document="i", article="a", edge="rel")
+               + " AND " + interpretation_body_guard("i"))
+_DOC_CASE_SOURCE = (document_citation_guard(document="cas", article="source", edge="rel")
+                    + " AND " + case_body_identity_guard("cas"))
 _DOC_RULING_SOURCE = document_citation_guard(
     document="ruling", article="source", edge="rel"
 )
 _DOC_INTERP_SOURCE = document_citation_guard(
     document="interp", article="source", edge="rel"
-)
-_DOC_CASE_VERSION = document_citation_guard(document="cas", article="v", edge="rel")
+) + " AND " + interpretation_body_guard("interp")
+_DOC_CASE_VERSION = (document_citation_guard(document="cas", article="v", edge="rel")
+                     + " AND " + verified_version_guard(node="v") + " AND " + case_body_identity_guard("cas"))
 _ARTICLE_REFS = article_references_guard(edge="r")
 _ARTICLE_REFS_REL = article_references_guard(edge="rel")
 _ARTICLE_ANNEX = article_annex_guard(article="a", annex="x", edge="rel")
@@ -60,6 +70,32 @@ def _document_rel_map(rel: str, graph_path: str) -> str:
 _CASE_REL_MAP = _document_rel_map("rel", "HAS_CASE edge")
 _RULING_REL_MAP = _document_rel_map("rel", "HAS_RULING edge")
 _INTERP_REL_MAP = _document_rel_map("rel", "HAS_INTERPRETATION edge")
+
+# An official execution-book publisher may leave the issuing agency unknown.
+# Admit only the verified latest public edition, never arbitrary unowned Rulings.
+_PUBLIC_EXECUTION_BOOK = """(
+    node:ReferenceBook AND node.active = true AND node.is_latest_official_edition = true
+    AND node.source_kind = 'nts_execution_book_edition'
+    AND node.catalogue_membership_verified = true
+    AND coalesce(node.source_snapshot, '') <> ''
+    AND EXISTS { MATCH (node)-[:HAS_SOURCE_RECEIPT]->(receipt:ReferenceBookReceipt)
+                 WHERE receipt.reference_book_id = node.ruling_id
+                   AND receipt.source_snapshot = node.source_snapshot
+                   AND coalesce(receipt.raw_sha256, '') <> '' }
+)"""
+
+
+_CURATED_ADMIN_RULE = """(
+    node:AdminRule AND node.is_current = true
+    AND node.corpus_scope = 'curated_tax_administrative'
+    AND coalesce(node.source_snapshot, '') <> ''
+    AND node.corpus_scope_source_snapshot = node.source_snapshot
+    AND size(coalesce(node.curation_manifest_sha256, '')) = 64
+    AND EXISTS { MATCH (node)-[:HAS_SOURCE_RECEIPT]->(receipt:AdministrativeSourceReceipt)
+                 WHERE receipt.receipt_id = node.source_snapshot
+                   AND receipt.source_id = node.ruling_id
+                   AND size(coalesce(receipt.raw_sha256, '')) = 64 }
+)"""
 
 
 def _node_id(node: str) -> str:
@@ -113,10 +149,10 @@ def _extend_paths(*steps: tuple[str, str, str]) -> str:
 
 _ARTICLE_FIELDS = (
     ".article_id, .article_number, .article_title, .article_content, .law_id, .law_name, "
-    ".article_type, .source_snapshot, .enforcement_date, .promulgation_date, "
+    ".article_type, .is_historical_only, .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .source_kind, .source_snapshot, .enforcement_date, .promulgation_date, "
     ".is_current, .valid_from, .valid_to, .version_id, .applies_note, .applies_source"
 )
-_BODY_FIELDS = ".content, .full_content, .full_text, .body"
+_BODY_FIELDS = ".content, .full_content, .extracted_content, .extracted_content_sha256, .source_kind, .original_attachment_available, .full_text, .body"
 _DOCUMENT_FIELDS = (
     ".source_snapshot, .source_projection_schema, .source_projection_kind, "
     ".source_projection_sha256, .source_projection_snapshot, .citation_temporal_evidence"
@@ -152,7 +188,7 @@ MATCH path = (start)-[:DELEGATES_TO*1..2]->(delegated:Article)
 WHERE all(rel IN relationships(path) WHERE {_DELEGATES_TO_RELS})
   AND {_PATH_NODES}
 RETURN delegated {{
-    _content_snapshot: delegated.source_snapshot,
+    _content_snapshot: delegated.source_snapshot, temporal_gate_state: delegated.temporal_gate_state, content_sha256: delegated.content_sha256, temporal_proof_valid_from: delegated.temporal_proof_valid_from, temporal_proof_valid_to: delegated.temporal_proof_valid_to, temporal_proof_content_sha256: delegated.temporal_proof_content_sha256, temporal_proof_source_snapshot: delegated.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot
 }} AS article,
@@ -169,7 +205,7 @@ MATCH path = (start)-[:DELEGATED_FROM*1..2]->(parent:Article)
 WHERE all(rel IN relationships(path) WHERE {_DELEGATED_FROM_RELS})
   AND {_PATH_NODES}
 RETURN parent {{
-    _content_snapshot: parent.source_snapshot,
+    _content_snapshot: parent.source_snapshot, temporal_gate_state: parent.temporal_gate_state, content_sha256: parent.content_sha256, temporal_proof_valid_from: parent.temporal_proof_valid_from, temporal_proof_valid_to: parent.temporal_proof_valid_to, temporal_proof_content_sha256: parent.temporal_proof_content_sha256, temporal_proof_source_snapshot: parent.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot
 }} AS article,
@@ -184,13 +220,17 @@ TRAVERSE_HAS_RULING = f"""
 MATCH (a:Article {{article_id: $article_id}})-[rel:HAS_RULING]->(r:Ruling)
 WHERE {_DOC_RULING}
   AND {_CURRENT_A}
-  AND (NOT r:ReferenceBook OR r.active = true)
+  AND (NOT r:ReferenceBook OR (r.active = true AND r.is_latest_official_edition = true))
   AND (NOT r:AdminRule OR r.is_current = true)
 RETURN r {{
-    _content_snapshot: r.source_snapshot,
+    _content_snapshot: r.source_snapshot, temporal_gate_state: r.temporal_gate_state, content_sha256: r.content_sha256, temporal_proof_valid_from: r.temporal_proof_valid_from, temporal_proof_valid_to: r.temporal_proof_valid_to, temporal_proof_content_sha256: r.temporal_proof_content_sha256, temporal_proof_source_snapshot: r.temporal_proof_source_snapshot,
     .ruling_id, .ruling_number, .ruling_title, .ruling_org,
-    .ruling_date, .query_summary, .answer_summary, .ruling_url,
+    .ruling_date, .content, .query_summary, .answer_summary, .ruling_url,
     .source_doc_number, .department_doc_number,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date,
+    .retirement_reason, .retirement_effective_date, .retirement_notice, .retirement_source_url, .retired_by_repeal_receipt_id, .retired_by_administrative_event_id, .retired_by_ruling_id, .source_kind, .body_scope, .source_event_type, .consolidated_rule_text_verified, .source_gazette_receipt_json, .source_gazette_page_index, .source_temporal_status, .official_current_flag, .source_attachment_receipts_json, .source_attachment_groups_json, .source_visual_evidence_json, .source_inline_visual_receipts_json, .inline_visual_originals_verified, .raw_sha256, .extracted_content, .extracted_content_sha256, .source_publisher, .reference_book_id, .edition_year,
+    .active, .is_latest_official_edition, .legal_effective_date_status, .source_publication_date,
     {_RULING_REL_MAP}
 }} AS ruling,
 rel.relevance_score AS relevance_score,
@@ -215,9 +255,12 @@ MATCH (a:Article {{article_id: $article_id}})-[rel:HAS_CASE]->(c:Case)
 WHERE {_DOC_CASE}
   AND {_CURRENT_A}
 RETURN c {{
-    _content_snapshot: c.source_snapshot,
+    _content_snapshot: c.source_snapshot, temporal_gate_state: c.temporal_gate_state, content_sha256: c.content_sha256, temporal_proof_valid_from: c.temporal_proof_valid_from, temporal_proof_valid_to: c.temporal_proof_valid_to, temporal_proof_content_sha256: c.temporal_proof_content_sha256, temporal_proof_source_snapshot: c.temporal_proof_source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete, .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256, .source_projection_sha256,
     .case_id, .case_number, .case_name, .court_name, .court_type,
-    .ruling_date, .ruling_type, .case_holding, .ruling_summary, .case_url
+    .ruling_date, .ruling_type, .case_holding, .ruling_summary, .case_url,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date
 }} AS case_data,
 rel.relevance_score AS relevance_score,
 '인용판례' AS edge_type,
@@ -243,7 +286,7 @@ WHERE {_ARTICLE_REFS}
   AND {_CURRENT_A}
   AND {_CURRENT_REF}
 RETURN ref {{
-    _content_snapshot: ref.source_snapshot,
+    _content_snapshot: ref.source_snapshot, temporal_gate_state: ref.temporal_gate_state, content_sha256: ref.content_sha256, temporal_proof_valid_from: ref.temporal_proof_valid_from, temporal_proof_valid_to: ref.temporal_proof_valid_to, temporal_proof_content_sha256: ref.temporal_proof_content_sha256, temporal_proof_source_snapshot: ref.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot
 }} AS article,
@@ -288,10 +331,17 @@ r.parent_source_snapshot AS parent_source_snapshot
 # ============================================================
 TRAVERSE_SIMILAR_RULING = """
 MATCH (r:Ruling {ruling_id: $ruling_id})-[rel:SIMILAR_ISSUE]-(similar:Ruling)
+WHERE (NOT similar:ReferenceBook OR (similar.active = true AND similar.is_latest_official_edition = true))
+  AND (NOT similar:AdminRule OR similar.is_current = true)
 RETURN similar {
-    _content_snapshot: similar.source_snapshot,
+    _content_snapshot: similar.source_snapshot, temporal_gate_state: similar.temporal_gate_state, content_sha256: similar.content_sha256, temporal_proof_valid_from: similar.temporal_proof_valid_from, temporal_proof_valid_to: similar.temporal_proof_valid_to, temporal_proof_content_sha256: similar.temporal_proof_content_sha256, temporal_proof_source_snapshot: similar.temporal_proof_source_snapshot,
     .ruling_id, .ruling_number, .ruling_title, .ruling_org,
-    .ruling_date, .query_summary, .answer_summary
+    .ruling_date, .content, .query_summary, .answer_summary, .ruling_url,
+    .body_status, .identity_status, .source_kind, .source_raw_sha256, .source_observed_at,
+    .body_scope, .source_event_type, .source_temporal_status, .official_current_flag,
+    .extracted_content, .extracted_content_sha256, .source_attachment_receipts_json, .source_attachment_groups_json,
+    .source_gazette_receipt_json, .source_gazette_page_index, .consolidated_rule_text_verified,
+    .source_visual_evidence_json, .source_inline_visual_receipts_json, .inline_visual_originals_verified, .raw_sha256
 } AS ruling,
 rel.similarity_score AS similarity_score,
 '유사쟁점' AS edge_type
@@ -299,10 +349,15 @@ rel.similarity_score AS similarity_score,
 
 TRAVERSE_SIMILAR_CASE = """
 MATCH (c:Case {case_id: $case_id})-[rel:SIMILAR_ISSUE]-(similar:Case)
+WHERE coalesce(c.body_identity_status, '') <> 'unresolved'
+  AND coalesce(similar.body_identity_status, '') <> 'unresolved'
 RETURN similar {
-    _content_snapshot: similar.source_snapshot,
+    _content_snapshot: similar.source_snapshot, temporal_gate_state: similar.temporal_gate_state, content_sha256: similar.content_sha256, temporal_proof_valid_from: similar.temporal_proof_valid_from, temporal_proof_valid_to: similar.temporal_proof_valid_to, temporal_proof_content_sha256: similar.temporal_proof_content_sha256, temporal_proof_source_snapshot: similar.temporal_proof_source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete, .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256, .source_projection_sha256,
+    .source_kind, .source_id, .source_raw_sha256, .identity_status, .body_status, .body_identity_status, .body_identity_notice,
     .case_id, .case_number, .case_name, .court_name,
-    .ruling_date, .case_holding, .ruling_summary
+    .ruling_date, .case_holding, .ruling_summary,
+    .date_status, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date
 } AS case_data,
 rel.similarity_score AS similarity_score,
 '유사쟁점' AS edge_type
@@ -313,7 +368,7 @@ rel.similarity_score AS similarity_score,
 # ============================================================
 
 # 법원 판결이 아닌 불복 결정 — 국세청 결정례는 scripts/collect_nts_decisions.py 가 court_type "국세청"으로 넣는다
-DECISION_COURT_TYPES = ("조세심판원", "국세청")
+DECISION_COURT_TYPES = ("조세심판원", "국세청", "감사원")
 _DECISION_TYPES = "[" + ", ".join(f"'{name}'" for name in DECISION_COURT_TYPES) + "]"
 
 # 조문 → 결정례 (court_type 이 불복 결정 기관인 Case만 필터)
@@ -323,10 +378,13 @@ WHERE {_DOC_CASE}
   AND {_CURRENT_A}
   AND c.court_type IN {_DECISION_TYPES}
 RETURN c {{
-    _content_snapshot: c.source_snapshot,
+    _content_snapshot: c.source_snapshot, temporal_gate_state: c.temporal_gate_state, content_sha256: c.content_sha256, temporal_proof_valid_from: c.temporal_proof_valid_from, temporal_proof_valid_to: c.temporal_proof_valid_to, temporal_proof_content_sha256: c.temporal_proof_content_sha256, temporal_proof_source_snapshot: c.temporal_proof_source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete, .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256, .source_projection_sha256,
     .case_id, .case_number, .case_name, .court_name, .court_type,
     .ruling_date, .ruling_type, .case_holding, .ruling_summary,
-    .full_content, .case_url, .decision_result
+    .full_content, .extracted_content, .extracted_content_sha256, .source_kind, .original_attachment_available, .case_url, .decision_result,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date
 }} AS tribunal,
 rel.relevance_score AS relevance_score,
 '조세심판례' AS edge_type,
@@ -345,14 +403,18 @@ ORDER BY c.ruling_date DESC
 
 # 결정례 전문검색 (case_content_ft 인덱스 활용, court_type 필터)
 FULLTEXT_SEARCH_TRIBUNALS = f"""
-CALL db.index.fulltext.queryNodes('case_content_ft', $query)
+CALL db.index.fulltext.queryNodes('case_original_content_ft_v2', $query)
 YIELD node, score
 WHERE score > $min_score AND node.court_type IN {_DECISION_TYPES}
+  AND {case_body_identity_guard("node")}
 RETURN node {{
-    _content_snapshot: node.source_snapshot,
+    _content_snapshot: node.source_snapshot, temporal_gate_state: node.temporal_gate_state, content_sha256: node.content_sha256, temporal_proof_valid_from: node.temporal_proof_valid_from, temporal_proof_valid_to: node.temporal_proof_valid_to, temporal_proof_content_sha256: node.temporal_proof_content_sha256, temporal_proof_source_snapshot: node.temporal_proof_source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete, .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256, .source_projection_sha256,
     .case_id, .case_number, .case_name, .court_name, .court_type,
-    .ruling_date, .ruling_type, .case_holding, .ruling_summary, .full_content,
-    .case_url, .decision_result
+    .ruling_date, .ruling_type, .case_holding, .ruling_summary, .full_content, .extracted_content, .extracted_content_sha256, .source_kind, .original_attachment_available,
+    .case_url, .decision_result,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date
 }} AS tribunal, score
 ORDER BY score DESC
 LIMIT $limit
@@ -366,9 +428,17 @@ MATCH (a:Article {{article_id: $article_id}})-[rel:HAS_INTERPRETATION]->(i:Inter
 WHERE {_DOC_INTERP}
   AND {_CURRENT_A}
 RETURN i {{
-    _content_snapshot: i.source_snapshot,
-    .interp_id, .interp_number, .interp_title, .reply_date, .content,
+    _content_snapshot: i.source_snapshot, temporal_gate_state: i.temporal_gate_state, content_sha256: i.content_sha256, temporal_proof_valid_from: i.temporal_proof_valid_from, temporal_proof_valid_to: i.temporal_proof_valid_to, temporal_proof_content_sha256: i.temporal_proof_content_sha256, temporal_proof_source_snapshot: i.temporal_proof_source_snapshot,
+    .source_kind, .interp_id, .interp_number, .interp_title, .reply_date, .reply_org, .content,
     .full_text, .source_doc_number, .department_doc_number, .interp_url,
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete,
+    .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256,
+    .latest_source_observation_status, .latest_source_observation_kind, .latest_source_observation_at, .latest_source_observation_raw_sha256, .latest_source_observation_url,
+    .maintenance_status, .maintenance_notice, .maintenance_semantic_revision,
+    .maintenance_history_json, .maintenance_followups_json,
+    .maintenance_previous_history_json,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date,
     {_INTERP_REL_MAP}
 }} AS interpretation,
 '법령해석례' AS edge_type,
@@ -388,7 +458,7 @@ TRAVERSE_CITES_ARTICLE = f"""
 MATCH (c:Case {{case_id: $case_id}})-[rel:CITES_ARTICLE]->(a:Article)
 WHERE {_DOC_CASE}
 RETURN a {{
-    _content_snapshot: a.source_snapshot,
+    _content_snapshot: a.source_snapshot, temporal_gate_state: a.temporal_gate_state, content_sha256: a.content_sha256, temporal_proof_valid_from: a.temporal_proof_valid_from, temporal_proof_valid_to: a.temporal_proof_valid_to, temporal_proof_content_sha256: a.temporal_proof_content_sha256, temporal_proof_source_snapshot: a.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot
 }} AS article,
@@ -432,7 +502,7 @@ MATCH (m:Amendment {{amendment_id: $amendment_id}})-[rel:REFERENCES]->(a:Article
 WHERE {_ARTICLE_REFS_REL}
   AND {_CURRENT_A}
 RETURN a {{
-    _content_snapshot: a.source_snapshot,
+    _content_snapshot: a.source_snapshot, temporal_gate_state: a.temporal_gate_state, content_sha256: a.content_sha256, temporal_proof_valid_from: a.temporal_proof_valid_from, temporal_proof_valid_to: a.temporal_proof_valid_to, temporal_proof_content_sha256: a.temporal_proof_content_sha256, temporal_proof_source_snapshot: a.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot
 }} AS article,
@@ -505,25 +575,32 @@ WITH seed, delegated_list, delegated_sources,
      collect([(source)-[rel:HAS_RULING]->(ruling:Ruling)
        WHERE {_DOC_RULING_SOURCE}
          AND {_CURRENT_SOURCE}
-         AND (NOT ruling:ReferenceBook OR ruling.active = true)
+         AND (NOT ruling:ReferenceBook OR (ruling.active = true AND ruling.is_latest_official_edition = true))
          AND (NOT ruling:AdminRule OR ruling.is_current = true) |
-       ruling {{_content_snapshot: ruling.source_snapshot, {_BODY_FIELDS},
+       ruling {{_content_snapshot: ruling.source_snapshot, temporal_gate_state: ruling.temporal_gate_state, content_sha256: ruling.content_sha256, temporal_proof_valid_from: ruling.temporal_proof_valid_from, temporal_proof_valid_to: ruling.temporal_proof_valid_to, temporal_proof_content_sha256: ruling.temporal_proof_content_sha256, temporal_proof_source_snapshot: ruling.temporal_proof_source_snapshot, {_BODY_FIELDS},
+               .retirement_reason, .retirement_effective_date, .retirement_notice, .retirement_source_url, .retired_by_repeal_receipt_id, .retired_by_administrative_event_id, .retired_by_ruling_id, .source_kind, .body_scope, .source_event_type, .consolidated_rule_text_verified, .source_gazette_receipt_json, .source_gazette_page_index, .source_temporal_status, .official_current_flag, .source_attachment_receipts_json, .source_attachment_groups_json, .source_visual_evidence_json, .source_inline_visual_receipts_json, .inline_visual_originals_verified, .raw_sha256, .extracted_content, .extracted_content_sha256, .source_publisher, .reference_book_id, .edition_year,
+               .active, .is_latest_official_edition, .legal_effective_date_status, .source_publication_date,
+               .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date,
                .ruling_id, .ruling_number, .ruling_title, .ruling_org,
-               .ruling_date, .query_summary, .answer_summary, .ruling_url,
+               .ruling_date, .content, .query_summary, .answer_summary, .ruling_url,
                .source_doc_number, .department_doc_number,
                {_RULING_REL_MAP}, graph_paths: {_extend_paths(('rel', 'source', 'ruling'))}}}][..25]) AS ruling_lists,
      collect([(source)-[rel:HAS_CASE]->(cas:Case)
        WHERE {_DOC_CASE_SOURCE}
          AND {_CURRENT_SOURCE} |
-       cas {{_content_snapshot: cas.source_snapshot, {_BODY_FIELDS},
-            .case_id, .case_number, .case_name, .court_name, .court_type,
+       cas {{_content_snapshot: cas.source_snapshot, temporal_gate_state: cas.temporal_gate_state, content_sha256: cas.content_sha256, temporal_proof_valid_from: cas.temporal_proof_valid_from, temporal_proof_valid_to: cas.temporal_proof_valid_to, temporal_proof_content_sha256: cas.temporal_proof_content_sha256, temporal_proof_source_snapshot: cas.temporal_proof_source_snapshot, {_BODY_FIELDS},
+            .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date,
+            .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete, .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256, .source_projection_sha256,
+    .case_id, .case_number, .case_name, .court_name, .court_type,
             .ruling_date, .ruling_type, .case_holding, .ruling_summary, .case_url,
             {_CASE_REL_MAP}, graph_paths: {_extend_paths(('rel', 'source', 'cas'))}}}][..25]) AS case_lists,
      collect([(source)-[r:REFERENCES]-(ref:Article)
        WHERE {_ARTICLE_REFS}
          AND {_CURRENT_SOURCE}
          AND {_CURRENT_REF} |
-       ref {{_content_snapshot: ref.source_snapshot, {_ARTICLE_FIELDS},
+       ref {{_content_snapshot: ref.source_snapshot, temporal_gate_state: ref.temporal_gate_state, content_sha256: ref.content_sha256, temporal_proof_valid_from: ref.temporal_proof_valid_from, temporal_proof_valid_to: ref.temporal_proof_valid_to, temporal_proof_content_sha256: ref.temporal_proof_content_sha256, temporal_proof_source_snapshot: ref.temporal_proof_source_snapshot, {_ARTICLE_FIELDS},
             temporal_resolution: r.temporal_resolution,
             reference_semantics: r.reference_semantics,
             evidence: r.evidence,
@@ -533,10 +610,18 @@ WITH seed, delegated_list, delegated_sources,
      collect([(source)-[rel:HAS_INTERPRETATION]->(interp:Interpretation)
        WHERE {_DOC_INTERP_SOURCE}
          AND {_CURRENT_SOURCE} |
-       interp {{_content_snapshot: interp.source_snapshot, .full_content, .body,
-               .interp_id, .interp_number, .interp_title, .reply_date, .content,
+       interp {{_content_snapshot: interp.source_snapshot, temporal_gate_state: interp.temporal_gate_state, content_sha256: interp.content_sha256, temporal_proof_valid_from: interp.temporal_proof_valid_from, temporal_proof_valid_to: interp.temporal_proof_valid_to, temporal_proof_content_sha256: interp.temporal_proof_content_sha256, temporal_proof_source_snapshot: interp.temporal_proof_source_snapshot, .full_content, .extracted_content, .extracted_content_sha256, .source_kind, .original_attachment_available, .body,
+               .source_kind, .interp_id, .interp_number, .interp_title, .reply_date, .reply_org, .content,
                .full_text,
                .source_doc_number, .department_doc_number, .interp_url,
+               .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete,
+    .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256,
+    .latest_source_observation_status, .latest_source_observation_kind, .latest_source_observation_at, .latest_source_observation_raw_sha256, .latest_source_observation_url,
+    .maintenance_status, .maintenance_notice, .maintenance_semantic_revision,
+               .maintenance_history_json, .maintenance_followups_json,
+               .maintenance_previous_history_json,
+               .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date,
                {_INTERP_REL_MAP}, graph_paths: {_extend_paths(('rel', 'source', 'interp'))}}}][..25]) AS interpretation_lists,
      collect([(source)-[rel:HAS_BASIC_RULE]->(b:BasicRule)
        WHERE EXISTS {{
@@ -544,7 +629,7 @@ WITH seed, delegated_list, delegated_sources,
              WHERE {_BASIC_RULE_SOURCE}
            }}
          AND {_CURRENT_SOURCE} |
-       b {{_content_snapshot: b.source_snapshot, .enforcement_date, .valid_from, .valid_to,
+       b {{_content_snapshot: b.source_snapshot, temporal_gate_state: b.temporal_gate_state, content_sha256: b.content_sha256, temporal_proof_valid_from: b.temporal_proof_valid_from, temporal_proof_valid_to: b.temporal_proof_valid_to, temporal_proof_content_sha256: b.temporal_proof_content_sha256, temporal_proof_source_snapshot: b.temporal_proof_source_snapshot, .enforcement_date, .valid_from, .valid_to,
           .rule_id, .rule_number, .rule_title, .rule_content, .source_url,
           temporal_resolution: coalesce(rel.temporal_resolution, b.temporal_resolution),
           edition_year: b.edition_year,
@@ -557,7 +642,7 @@ WITH seed, delegated_list, delegated_sources,
      collect([(source)-[rel:HAS_APPLICABILITY_EVIDENCE]->(m:Amendment)
        WHERE {_ARTICLE_REFS_REL}
          AND {_CURRENT_SOURCE} |
-       m {{_content_snapshot: m.source_snapshot, {_BODY_FIELDS}, .enforcement_date,
+       m {{_content_snapshot: m.source_snapshot, temporal_gate_state: m.temporal_gate_state, content_sha256: m.content_sha256, temporal_proof_valid_from: m.temporal_proof_valid_from, temporal_proof_valid_to: m.temporal_proof_valid_to, temporal_proof_content_sha256: m.temporal_proof_content_sha256, temporal_proof_source_snapshot: m.temporal_proof_source_snapshot, {_BODY_FIELDS}, .enforcement_date,
           .amendment_id, .law_name, .promulgation_number, .promulgation_date,
           .enforcement_text, .application_text, .transitional_text,
           .clause_titles, .referenced_articles,
@@ -576,7 +661,7 @@ WITH seed, delegated_list, delegated_sources,
          resolved_version_id: rel.resolved_version_id,
          version_id: v.version_id,
          article_id: v.article_id, article_number: v.article_number,
-         _content_snapshot: v.source_snapshot, verified: v.verified, source_verified: v.source_verified,
+         _content_snapshot: v.source_snapshot, temporal_gate_state: v.temporal_gate_state, content_sha256: v.content_sha256, temporal_proof_valid_from: v.temporal_proof_valid_from, temporal_proof_valid_to: v.temporal_proof_valid_to, temporal_proof_content_sha256: v.temporal_proof_content_sha256, temporal_proof_source_snapshot: v.temporal_proof_source_snapshot, verified: v.verified, source_verified: v.source_verified,
          applicable_date: rel.applicable_date,
          law_name: v.law_name,
          article_title: v.article_title,
@@ -595,9 +680,9 @@ WITH seed, delegated_list, delegated_sources,
          graph_path: 'CITES_ARTICLE_VERSION edge',
          graph_paths: {_extend_paths(('version_rel', 'source', 'v'), ('rel', 'v', 'cas'))}}}][..10]) AS cited_version_lists
 
-RETURN seed {{_content_snapshot: seed.source_snapshot, {_ARTICLE_FIELDS},
+RETURN seed {{_content_snapshot: seed.source_snapshot, temporal_gate_state: seed.temporal_gate_state, content_sha256: seed.content_sha256, temporal_proof_valid_from: seed.temporal_proof_valid_from, temporal_proof_valid_to: seed.temporal_proof_valid_to, temporal_proof_content_sha256: seed.temporal_proof_content_sha256, temporal_proof_source_snapshot: seed.temporal_proof_source_snapshot, {_ARTICLE_FIELDS},
               graph_path: 'seed article lookup', graph_paths: [{_root_path()}]}} AS seed_article,
-       [d IN delegated_list | d {{_content_snapshot: d.source_snapshot,
+       [d IN delegated_list | d {{_content_snapshot: d.source_snapshot, temporal_gate_state: d.temporal_gate_state, content_sha256: d.content_sha256, temporal_proof_valid_from: d.temporal_proof_valid_from, temporal_proof_valid_to: d.temporal_proof_valid_to, temporal_proof_content_sha256: d.temporal_proof_content_sha256, temporal_proof_source_snapshot: d.temporal_proof_source_snapshot,
           {_ARTICLE_FIELDS}, graph_path: 'DELEGATES_TO path',
           graph_paths: reduce(routes = [], entry IN delegated_sources |
               routes + CASE WHEN entry.node = d THEN entry.paths ELSE [] END)}}] AS delegated_articles,
@@ -619,7 +704,7 @@ YIELD node, score
 WHERE score > $min_score
   AND {current_owned_article_guard('node')}
 RETURN node {{
-    _content_snapshot: node.source_snapshot,
+    _content_snapshot: node.source_snapshot, temporal_gate_state: node.temporal_gate_state, content_sha256: node.content_sha256, temporal_proof_valid_from: node.temporal_proof_valid_from, temporal_proof_valid_to: node.temporal_proof_valid_to, temporal_proof_content_sha256: node.temporal_proof_content_sha256, temporal_proof_source_snapshot: node.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot
 }} AS article, score
@@ -771,47 +856,67 @@ LIMIT $limit
 """
 
 FULLTEXT_SEARCH_CASES = """
-CALL db.index.fulltext.queryNodes('case_content_ft', $query)
+CALL db.index.fulltext.queryNodes('case_original_content_ft_v2', $query)
 YIELD node, score
-WHERE score > $min_score
+WHERE score > $min_score AND coalesce(node.body_identity_status, '') <> 'unresolved'
 RETURN node {
-    _content_snapshot: node.source_snapshot,
+    _content_snapshot: node.source_snapshot, temporal_gate_state: node.temporal_gate_state, content_sha256: node.content_sha256, temporal_proof_valid_from: node.temporal_proof_valid_from, temporal_proof_valid_to: node.temporal_proof_valid_to, temporal_proof_content_sha256: node.temporal_proof_content_sha256, temporal_proof_source_snapshot: node.temporal_proof_source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete, .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256, .source_projection_sha256,
     .case_id, .case_number, .case_name, .court_name, .court_type,
-    .ruling_date, .case_holding, .ruling_summary, .full_content, .decision_result
+    .ruling_date, .case_holding, .ruling_summary, .full_content, .extracted_content, .extracted_content_sha256, .source_kind, .original_attachment_available, .decision_result,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date
 } AS case_data, score
 ORDER BY score DESC
 LIMIT $limit
 """
 
 FULLTEXT_SEARCH_RULINGS = """
-CALL db.index.fulltext.queryNodes('ruling_content_ft', $query)
+CALL db.index.fulltext.queryNodes('ruling_original_content_ft_v2', $query)
 YIELD node, score
-WHERE score > $min_score AND node.ruling_org IN $tax_orgs
-  AND (NOT node:ReferenceBook OR node.active = true)
+WHERE score > $min_score AND (node.ruling_org IN $tax_orgs OR __PUBLIC_EXECUTION_BOOK__ OR __CURATED_ADMIN_RULE__)
+  AND (NOT node:ReferenceBook OR (node.active = true AND node.is_latest_official_edition = true))
   AND (NOT node:AdminRule OR node.is_current = true)
 RETURN node {
-    _content_snapshot: node.source_snapshot,
+    _content_snapshot: node.source_snapshot, temporal_gate_state: node.temporal_gate_state, content_sha256: node.content_sha256, temporal_proof_valid_from: node.temporal_proof_valid_from, temporal_proof_valid_to: node.temporal_proof_valid_to, temporal_proof_content_sha256: node.temporal_proof_content_sha256, temporal_proof_source_snapshot: node.temporal_proof_source_snapshot,
     .ruling_id, .ruling_number, .ruling_title, .ruling_org,
-    .ruling_date, .query_summary, .answer_summary,
-    .source_doc_number, .department_doc_number
+    .retirement_reason, .retirement_effective_date, .retirement_notice, .retirement_source_url, .retired_by_repeal_receipt_id, .retired_by_administrative_event_id, .retired_by_ruling_id, .source_kind, .body_scope, .source_event_type, .consolidated_rule_text_verified, .source_gazette_receipt_json, .source_gazette_page_index, .source_temporal_status, .official_current_flag, .source_attachment_receipts_json, .source_attachment_groups_json, .source_visual_evidence_json, .source_inline_visual_receipts_json, .inline_visual_originals_verified, .raw_sha256, .extracted_content, .extracted_content_sha256, .source_publisher, .reference_book_id, .edition_year,
+    .active, .is_latest_official_edition, .legal_effective_date_status, .source_publication_date,
+    .ruling_date, .content, .query_summary, .answer_summary, .ruling_url,
+    .source_doc_number, .department_doc_number,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date
 } AS ruling, score
 ORDER BY score DESC
 LIMIT $limit
-"""
+""".replace("__PUBLIC_EXECUTION_BOOK__", _PUBLIC_EXECUTION_BOOK).replace("__CURATED_ADMIN_RULE__", _CURATED_ADMIN_RULE)
 
 FULLTEXT_SEARCH_INTERPRETATIONS = """
-CALL db.index.fulltext.queryNodes('interp_content_ft', $query)
+CALL db.index.fulltext.queryNodes('interp_original_content_ft_v3', $query)
 YIELD node, score
-WHERE score > $min_score
+WHERE (score > $min_score OR (
+    node.source_kind = 'nts_action_detail'
+    AND node.extraction_provenance IN ['verified_official_inline_image_transcription', 'verified_official_inline_image_transcription_bundle', 'verified_official_editor_hwp_image_transcription_bundle']
+    AND $literal_query <> ''
+    AND toLower(coalesce(node.extracted_content, '')) CONTAINS toLower($literal_query)
+)) AND __INTERPRETATION_BODY_GUARD__
 RETURN node {
-    _content_snapshot: node.source_snapshot,
-    .interp_id, .interp_number, .interp_title, .content, .full_text, .reply_date,
+    _content_snapshot: node.source_snapshot, temporal_gate_state: node.temporal_gate_state, content_sha256: node.content_sha256, temporal_proof_valid_from: node.temporal_proof_valid_from, temporal_proof_valid_to: node.temporal_proof_valid_to, temporal_proof_content_sha256: node.temporal_proof_content_sha256, temporal_proof_source_snapshot: node.temporal_proof_source_snapshot,
+    .source_kind, .interp_id, .interp_number, .interp_title, .content, .full_text, .reply_date,
     .inquiry_org, .reply_org, .interp_url,
-    .source_doc_number, .department_doc_number
+    .extracted_content, .extracted_content_sha256, .extraction_method, .extraction_provenance, .extraction_complete,
+    .extraction_source_raw_sha256, .extraction_source_projection_sha256, .extraction_source_id, .original_image_sha256, .source_image_transcriptions_json, .extraction_review_sha256,
+    .latest_source_observation_status, .latest_source_observation_kind, .latest_source_observation_at, .latest_source_observation_raw_sha256, .latest_source_observation_url,
+    .maintenance_status, .maintenance_notice, .maintenance_semantic_revision,
+    .maintenance_history_json, .maintenance_followups_json,
+    .maintenance_previous_history_json,
+    .body_identity_status, .body_identity_notice, .listed_case_number, .original_case_number, .body_status, .original_document_available, .text_extraction_status, .text_completeness_status, .extraction_geometry_verified, .availability_status, .availability_followup_status, .identity_status, .source_id, .source_raw_sha256, .source_observed_at,
+    .date_status, .temporal_status, .source_conflict, .source_metadata_date_kind, .listing_date, .listed_decision_date, .document_decision_date, .original_document_date,
+    .source_doc_number, .department_doc_number, .source_projection_sha256
 } AS interpretation, score
 ORDER BY score DESC
 LIMIT $limit
-"""
+""".replace("__INTERPRETATION_BODY_GUARD__", interpretation_body_guard("node"))
 
 # 조세조약 조문 전문검색 — 국가명이 특정되면 country로 좁힌다.
 # 한 나라에 원조약·개정의정서가 여럿이라(일본 5건) 키워드만으로는 다 걸린다.
@@ -826,7 +931,9 @@ WHERE score > $min_score
   AND NOT coalesce(node.is_annex, false)
 MATCH (t:Treaty)-[:CONTAINS]->(node)
 RETURN node {
-    .treaty_article_id, .article_number, .article_title, .content, .country
+    .treaty_article_id, .article_number, .article_title, .content, .country,
+    .source_kind, .document_type, .is_whole_document, .body_representation,
+    .source_snapshot, .source_url, .source_sha256, .content_sha256
 } AS treaty_article,
        t.treaty_name AS treaty_name, t.treaty_type AS treaty_type,
        t.effective_date AS effective_date, score
@@ -853,7 +960,7 @@ WITH a, l,
      CASE WHEN l.law_name = $law_name THEN 0 ELSE 1 END AS law_rank,
      CASE WHEN $article_number = '' OR a.article_number = $article_number THEN 0 ELSE 1 END AS article_rank
 RETURN a {{
-    _content_snapshot: a.source_snapshot,
+    _content_snapshot: a.source_snapshot, temporal_gate_state: a.temporal_gate_state, content_sha256: a.content_sha256, temporal_proof_valid_from: a.temporal_proof_valid_from, temporal_proof_valid_to: a.temporal_proof_valid_to, temporal_proof_content_sha256: a.temporal_proof_content_sha256, temporal_proof_source_snapshot: a.temporal_proof_source_snapshot,
     .article_id, .article_number, .article_title, .article_content,
     .law_id, .article_type, .source_snapshot,
     law_name: l.law_name, enforcement_date: l.enforcement_date
@@ -876,7 +983,10 @@ WHERE x.law_name CONTAINS $law_name
   AND replace(x.annex_number, ' ', '') = replace($annex_number, ' ', '')
 RETURN x {
     .annex_id, .law_name, .annex_type, .annex_number, .annex_branch,
-    .annex_title, .content, .related_articles
+    .annex_title, .content, .related_articles, .source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method,
+    .original_binary_sha256, .original_binary_format, .extraction_source_snapshot,
+    .extraction_source_url, .extraction_geometry_verified, .extraction_provenance
 } AS annex,
 CASE WHEN x.law_name = $law_name THEN 0 ELSE 1 END AS law_rank
 ORDER BY law_rank ASC, x.annex_branch ASC
@@ -887,13 +997,16 @@ LIMIT $limit
 # 같은 서식이 조특법 시행규칙에도 있어(감가상각비조정명세서 9의4) 법령 필터가
 # 없으면 엉뚱한 법령의 서식이 점수 상위로 온다 (실측 2026-09-02).
 FULLTEXT_SEARCH_ANNEXES = """
-CALL db.index.fulltext.queryNodes('annex_content_ft', $query)
+CALL db.index.fulltext.queryNodes('annex_original_content_ft_v2', $query)
 YIELD node, score
 WHERE score > $min_score
   AND ($law_name IS NULL OR node.law_name CONTAINS $law_name)
 RETURN node {
     .annex_id, .law_name, .annex_type, .annex_number, .annex_branch,
-    .annex_title, .content, .related_articles
+    .annex_title, .content, .related_articles, .source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method,
+    .original_binary_sha256, .original_binary_format, .extraction_source_snapshot,
+    .extraction_source_url, .extraction_geometry_verified, .extraction_provenance
 } AS annex, score
 ORDER BY score DESC
 LIMIT $limit
@@ -912,7 +1025,10 @@ WITH x, min(a.article_id) AS from_article,
 RETURN x {{
     .annex_id, .law_name, .annex_type, .annex_number, .annex_branch,
     .annex_title, .content, .related_articles, .source_snapshot,
-    _content_snapshot: x.source_snapshot, graph_paths: routes
+    .extracted_content, .extracted_content_sha256, .extraction_method,
+    .original_binary_sha256, .original_binary_format, .extraction_source_snapshot,
+    .extraction_source_url, .extraction_geometry_verified, .extraction_provenance,
+    _content_snapshot: x.source_snapshot, temporal_gate_state: x.temporal_gate_state, content_sha256: x.content_sha256, temporal_proof_valid_from: x.temporal_proof_valid_from, temporal_proof_valid_to: x.temporal_proof_valid_to, temporal_proof_content_sha256: x.temporal_proof_content_sha256, temporal_proof_source_snapshot: x.temporal_proof_source_snapshot, graph_paths: routes
 }} AS annex, from_article
 ORDER BY x.annex_number
 LIMIT $limit
@@ -928,7 +1044,10 @@ WITH x, size([t IN $terms WHERE x.annex_title CONTAINS t]) AS hits
 WHERE hits > 0
 RETURN x {
     .annex_id, .law_name, .annex_type, .annex_number, .annex_branch,
-    .annex_title, .content, .related_articles
+    .annex_title, .content, .related_articles, .source_snapshot,
+    .extracted_content, .extracted_content_sha256, .extraction_method,
+    .original_binary_sha256, .original_binary_format, .extraction_source_snapshot,
+    .extraction_source_url, .extraction_geometry_verified, .extraction_provenance
 } AS annex, hits
 ORDER BY hits DESC, size(x.annex_title) ASC, x.annex_number ASC
 LIMIT $limit
