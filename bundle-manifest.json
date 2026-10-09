@@ -1,10 +1,10 @@
 {
   "schema": "tax-public-mcp-bundle-v1",
-  "source_revision": "2e2bf9df03db59a327bb2b3494a34d8a31284aac",
+  "source_revision": "218e2998285c32b296b5fd255461e0054998591f",
   "source_dirty": true,
   "files": {
     "server.py": {
-      "sha256": "fb6429ce5a3a11d6fdc6320ccf105a7b2a1275baa555744ac880038e6d09832c",
+      "sha256": "3a6239d153b8a48c0869923922d9affd0e0601aee494b7a720e116c0f7cd40a3",
       "source": "mcp/server.py"
     },
     "src/__init__.py": {
@@ -52,5 +52,5 @@
       "source": "src/search/source_quality.py"
     }
   },
-  "payload_sha256": "2f99162fa04df23cbc87f65f3cacbe8686ddca47c57a5fed3a0875f6398a8e74"
+  "payload_sha256": "82ad9cfccc8101cb584f80718d39e7eb5b1432ce2b8f7dd475cc03ad4065fb06"
 }

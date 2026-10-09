@@ -54,7 +54,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.9.1"
+SERVER_VERSION = "0.9.2"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -815,7 +815,7 @@ def bigram_sim(q: str, t: str) -> float:
 
 def doc_key(s: str) -> str:
     """문서번호 비교용 — 날짜 괄호·공백·기호를 떼고 숫자 앞 0을 없앤다('서면-2023-법규기본-0950' = '서면2023법규기본950')."""
-    s = re.sub(r"\(\d{4}\.[^)]*\)", "", s or "")
+    s = re.sub(r"\(\s*\d{4}\.[^)]*\)|,\s*\d{4}\.\s?\d{1,2}\.\s?\d{1,2}\.?", "", s or "")
     return re.sub(r"(?<!\d)0+(?=\d)", "", re.sub(r"[^0-9A-Za-z가-힣]", "", s))
 
 
