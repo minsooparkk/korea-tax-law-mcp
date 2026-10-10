@@ -31,6 +31,11 @@ STABLE_TOOLS = {
 
 
 class SchemaCompatibilityTests(unittest.TestCase):
+    def test_every_tool_is_read_only(self):
+        for tool in server.TOOLS:
+            self.assertTrue(tool["annotations"]["readOnlyHint"], tool["name"])
+            self.assertFalse(tool["annotations"]["destructiveHint"], tool["name"])
+
     def test_tool_names_and_required_args_unchanged(self):
         names = [t["name"] for t in server.TOOLS]
         self.assertEqual(names, list(STABLE_TOOLS))
@@ -40,12 +45,12 @@ class SchemaCompatibilityTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
 
     def test_version_and_initialize_payload(self):
-        self.assertEqual(server.SERVER_VERSION, "0.9.2")
+        self.assertEqual(server.SERVER_VERSION, "0.11.0")
         resp = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             "127.0.0.1",
         )
-        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.9.2")
+        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.11.0")
         self.assertIn("검증", resp["result"]["instructions"])
 
     def test_tools_list_keeps_input_schema_keys(self):
@@ -59,7 +64,17 @@ class SchemaCompatibilityTests(unittest.TestCase):
         self.assertEqual(set(art), {"law_name", "article_number"})
 
 
+LAW_NAMES = ["소득세법", "소득세법 시행령", "소득세법 시행규칙"]
+
+
 class GetArticleFormatTests(unittest.TestCase):
+    def setUp(self):
+        # 법령명 해석은 현행 법령 목록을 한 번 읽는다 — 가짜 DB 쿼리 순서와 섞이지 않게 목록을 고정한다
+        patcher = mock.patch.object(server, "_law_index", return_value=(
+            LAW_NAMES, {server.law_key(n): n for n in LAW_NAMES}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_get_article_uses_guarded_queries_and_uncertainty_footer(self):
         calls = []
 

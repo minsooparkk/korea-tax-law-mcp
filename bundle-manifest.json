@@ -1,15 +1,31 @@
 {
   "schema": "tax-public-mcp-bundle-v1",
-  "source_revision": "218e2998285c32b296b5fd255461e0054998591f",
+  "source_revision": "e518721c2bbb823db23861a68a017a30d353aaec",
   "source_dirty": true,
   "files": {
     "server.py": {
-      "sha256": "3a6239d153b8a48c0869923922d9affd0e0601aee494b7a720e116c0f7cd40a3",
+      "sha256": "c4acec7ab2a769f7ad16901ba51fa7969328ad1e6247d4fb5abd593db1217ded",
       "source": "mcp/server.py"
     },
     "src/__init__.py": {
       "sha256": "4d63bd274a1529c933f3500c2a9f747951e8bbdd5cdfa9ff3f948905944e2ab0",
       "source": "generated"
+    },
+    "src/parsers/__init__.py": {
+      "sha256": "4f11245bbb8c4727d95719be353f85766b4b39eba5f920a21e8bda5015f0acfd",
+      "source": "generated"
+    },
+    "src/parsers/article_renumbering.json": {
+      "sha256": "46aad0c99e15ca00aa6df7bea9ad2f77af471859cc0150da41b7db22b76c4814",
+      "source": "src/parsers/article_renumbering.json"
+    },
+    "src/parsers/law_aliases.py": {
+      "sha256": "7b2da16d465f0e6fd8d8f542237827f1430ad3a8fad2c18e764f3efe9765fbfd",
+      "source": "src/parsers/law_aliases.py"
+    },
+    "src/parsers/renumbering.py": {
+      "sha256": "8b8b3e1912a2012bb22ee5ad1df2583ddeced7d8bb6fb72c2155f21f0e99d05e",
+      "source": "src/parsers/renumbering.py"
     },
     "src/pipeline/__init__.py": {
       "sha256": "4721c3254b3f7899ca2bf53b3b31005da5c16b0bde23c7664de69ede2ca92e06",
@@ -52,5 +68,5 @@
       "source": "src/search/source_quality.py"
     }
   },
-  "payload_sha256": "82ad9cfccc8101cb584f80718d39e7eb5b1432ce2b8f7dd475cc03ad4065fb06"
+  "payload_sha256": "3d798de5fec61e3e6b9b007431af4c6cdaffc208e85331ebaa3c5d3df0e1748f"
 }

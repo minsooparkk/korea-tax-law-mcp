@@ -40,6 +40,8 @@ REPO = os.path.dirname(SCRIPT_DIR)
 if os.path.isdir(os.path.join(REPO, "src")):
     sys.path.insert(0, REPO)
 
+from src.parsers.law_aliases import FORMER_NAMES, PRACTICE_ALIASES
+from src.parsers.renumbering import load_renumbering
 from src.search.graph_searcher import (
     annex_body,
     original_attachment_url,
@@ -54,7 +56,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.9.2"
+SERVER_VERSION = "0.11.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -188,6 +190,147 @@ def fmt_date(d) -> str:
 def clip(s, n=300) -> str:
     s = (s or "").replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
+
+
+# ---------------------------------------------------------------- 법령명 해석
+# 약칭(조특법·상증법)·띄어쓰기·가운뎃점·낫표 차이를 흡수해 현행 법령명 하나로 푼다.
+# 부분 일치는 같은 법령 묶음(법·시행령·시행규칙)일 때만 받고, 다른 법령이 섞이면 후보를 돌려준다.
+# 옛 이름(상속세법·조세감면규제법)은 전부개정 전 번호라 현행 조문으로 풀지 않는다.
+
+_DOTS = re.compile(r"[\s·ㆍ‧•・「」『』]")
+_LAW_CACHE: dict = {"at": 0.0, "names": [], "keys": {}}
+_LAW_CACHE_TTL = 600
+
+
+def law_key(name: str) -> str:
+    return _DOTS.sub("", str(name or ""))
+
+
+def _law_index() -> tuple[list[str], dict[str, str]]:
+    now = time.time()
+    if not _LAW_CACHE["names"] or now - _LAW_CACHE["at"] > _LAW_CACHE_TTL:
+        rows = cypher(
+            "MATCH (l:Law) WHERE " + current_law_guard(law="l") + " "
+            "RETURN l.law_name AS name, l.law_name_abbr AS abbr", {}
+        )
+        names = sorted({r["name"] for r in rows if r.get("name")})
+        keys = {}
+        for official, aliases in PRACTICE_ALIASES.items():
+            if official in names:
+                for a in aliases:
+                    keys[law_key(a)] = official
+        for r in rows:
+            if r.get("abbr") and r.get("name"):
+                keys.setdefault(law_key(r["abbr"]), r["name"])
+        for n in names:  # 정식 이름이 약칭보다 앞선다
+            keys[law_key(n)] = n
+        _LAW_CACHE.update(at=now, names=names, keys=keys)
+    return _LAW_CACHE["names"], _LAW_CACHE["keys"]
+
+
+def resolve_law(raw: str, *, partial: bool = True) -> dict:
+    """status: ok(name·how) / former(current·date) / ambiguous(candidates) / not_found."""
+    text = str(raw or "").strip().strip("「」『』").strip()
+    key = law_key(text)
+    if not key:
+        return {"status": "not_found", "input": text}
+    names, keys = _law_index()
+    if key in keys:
+        name = keys[key]
+        return {"status": "ok", "name": name, "input": text,
+                "how": "exact" if text == name else ("nospace" if law_key(name) == key else "alias")}
+    former = {law_key(k): v for k, v in FORMER_NAMES.items()}
+    if key in former:
+        current, date = former[key]
+        return {"status": "former", "input": text, "current": current, "date": date}
+    if not partial:
+        return {"status": "not_found", "input": text}
+    hits = [n for n in names if key in law_key(n)]
+    hits = [n for n in hits if law_key(n).startswith(key)] or hits  # '부가가치세'는 특례규정보다 부가가치세법 묶음
+    if hits:
+        head = min(hits, key=len)
+        if all(law_key(h).startswith(law_key(head)) for h in hits):
+            return {"status": "ok", "name": head, "input": text, "how": "partial"}
+        return {"status": "ambiguous", "input": text, "candidates": hits[:12]}
+    near = sorted(names, key=lambda n: bigram_sim(key, law_key(n)), reverse=True)[:3]
+    return {"status": "not_found", "input": text,
+            "suggestions": [n for n in near if bigram_sim(key, law_key(n)) >= 0.3]}
+
+
+def law_resolution_message(res: dict) -> str:
+    """ok가 아닌 해석 결과를 사용자 안내 문장으로."""
+    if res["status"] == "former":
+        return (f"'{res['input']}'은 옛 법령명입니다(현행 「{res['current']}」, {fmt_date(res['date'])} 개정으로 이름 변경). "
+                "옛 이름으로 인용된 조문 번호는 그 개정 전 번호라 현행 조문과 다를 수 있어 현행 조문으로 대신 답하지 않습니다. "
+                f"현행 조문은 law_name='{res['current']}'로 조회하세요.")
+    if res["status"] == "ambiguous":
+        return (f"법령명 '{res['input']}'에 해당하는 법령이 여럿입니다. 정확한 이름으로 다시 조회하세요: "
+                + ", ".join(res["candidates"]))
+    msg = f"법령명 '{res['input']}'을 이 DB에서 찾지 못했습니다."
+    if res.get("suggestions"):
+        msg += " 비슷한 이름: " + ", ".join(res["suggestions"]) + "."
+    return msg + " 수록 법령은 list_laws로 확인하세요(미수록 법령은 law.go.kr)."
+
+
+def law_filter(raw) -> str | None:
+    """검색 도구의 법령명 필터(부분 일치)용. 약칭·띄어쓰기만 정식 이름으로 바꾸고 나머지는 그대로 둔다."""
+    if not raw:
+        return None
+    res = resolve_law(raw, partial=False)
+    return res["name"] if res["status"] == "ok" else str(raw).strip()
+
+
+def resolved_note(res: dict) -> str:
+    if res.get("how") in ("alias", "partial"):
+        return f"(입력한 법령명 '{res['input']}' → 「{res['name']}」로 조회)"
+    return ""
+
+
+_ARTICLE_NO_RE = re.compile(r"^제(\d+)조(?:의(\d+))?$")
+_ARTICLE_NUMBERS: dict = {}
+
+
+def _article_sort_key(no: str) -> tuple:
+    m = _ARTICLE_NO_RE.match(no or "")
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else (10**9, 0)
+
+
+def current_article_numbers(law: str) -> list[str]:
+    hit = _ARTICLE_NUMBERS.get(law)
+    if hit and time.time() - hit[0] < _LAW_CACHE_TTL:
+        return hit[1]
+    rows = cypher(
+        "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
+        f"WHERE l.law_name = $law AND {current_law_guard(law='l')} "
+        f"AND {current_article_guard(node='a')} AND {current_contains_guard(edge='owns', law='l')} "
+        "RETURN DISTINCT a.article_number AS no",
+        {"law": law},
+    )
+    nums = sorted((r["no"] for r in rows if _ARTICLE_NO_RE.match(r.get("no") or "")), key=_article_sort_key)
+    if len(_ARTICLE_NUMBERS) > 200:
+        _ARTICLE_NUMBERS.clear()
+    _ARTICLE_NUMBERS[law] = (time.time(), nums)
+    return nums
+
+
+def article_range(law: str, no: str) -> dict:
+    """없는 조문일 때 그 법령의 현행 조문 범위와 같은 조 번호대 가지 조문."""
+    nums = current_article_numbers(law)
+    if not nums:
+        return {}
+    base = _article_sort_key(no)[0]
+    siblings = [n for n in nums if _article_sort_key(n)[0] == base]
+    return {"range": f"{nums[0]}~{nums[-1]}", "count": len(nums), "siblings": siblings[:12]}
+
+
+def article_missing_message(law: str, no: str) -> str:
+    info = article_range(law, no)
+    if not info:
+        return f"「{law}」의 현행 조문 정보를 찾지 못했습니다."
+    msg = f"「{law}」에 현행 {no}가 없습니다. 현행 조문 범위: {info['range']} (총 {info['count']:,}개)."
+    if info["siblings"]:
+        msg += " 같은 조 번호대: " + ", ".join(info["siblings"]) + "."
+    return msg + " 삭제되었거나 번호가 옮겨진 조문, 또는 잘못 적은 번호일 수 있습니다."
 
 
 # ---------------------------------------------------------------- 검증 그래프 가드
@@ -510,7 +653,7 @@ Q_VERIFIED_CITATIONS = (
 
 Q_ARTICLE_HISTORY = (
     "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
-    f"WHERE l.law_name CONTAINS $law AND a.article_number = $no "
+    f"WHERE l.law_name = $law AND a.article_number = $no "
     f"AND {current_law_guard(law='l')} "
     f"AND {current_article_guard(node='a')} "
     f"AND {current_contains_guard(edge='owns', law='l')} "
@@ -524,7 +667,7 @@ Q_ARTICLE_HISTORY = (
 
 Q_CURRENT_ARTICLE_MARKS = (
     "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
-    f"WHERE l.law_name CONTAINS $law AND a.article_number = $no "
+    f"WHERE l.law_name = $law AND a.article_number = $no "
     f"AND {current_law_guard(law='l')} "
     f"AND {current_article_guard(node='a')} "
     f"AND {current_contains_guard(edge='owns', law='l')} "
@@ -600,7 +743,7 @@ def t_list_laws(args: dict) -> str:
 
 def t_search_articles(args: dict) -> str:
     q = lucene_escape(str(args["query"]))
-    law = args.get("law_name")
+    law = law_filter(args.get("law_name"))
     limit = min(int(args.get("limit", 8)), 20)
     rows = cypher(Q_SEARCH_ARTICLES_FT, {"q": q, "law": law, "limit": limit})
     fallback_term = None
@@ -636,18 +779,20 @@ def t_search_articles(args: dict) -> str:
 
 
 def t_get_article(args: dict) -> str:
-    law = str(args["law_name"]).strip()
     no = norm_article_no(args["article_number"])
+    res = resolve_law(args["law_name"])  # 약칭·띄어쓰기·부분 이름(예: '상속세' → '상속세 및 증여세법')
+    if res["status"] != "ok":
+        return law_resolution_message(res)
+    law = res["name"]
     rows = cypher(q_current_article("l.law_name = $law"), {"law": law, "no": no})
-    if not rows:  # 부분 법령명 허용 (예: '상속세' → '상속세 및 증여세법')
-        rows = cypher(q_current_article("l.law_name CONTAINS $law"), {"law": law, "no": no})
     if not rows:
-        return f"'{law} {no}' 조문을 찾지 못함. list_laws로 정확한 법령명을 확인하세요."
+        return article_missing_message(law, no)
     r = rows[0]
     deleg = cypher(Q_DELEGATES_TO, {"aid": r["aid"]})
     parent = cypher(Q_DELEGATED_FROM, {"aid": r["aid"]})
     out = [
         f"# {r['law']} {r['no']} {r['title'] or ''}",
+        *([note] if (note := resolved_note(res)) else []),
         f"(현행, 시행 {fmt_date(r['enf'])})",
         "",
         r["content"] or "",
@@ -704,11 +849,16 @@ def t_get_article(args: dict) -> str:
 
 
 def t_get_article_history(args: dict) -> str:
-    law = str(args["law_name"]).strip()
     no = norm_article_no(args["article_number"])
+    res = resolve_law(args["law_name"])
+    if res["status"] != "ok":
+        return law_resolution_message(res)
+    law = res["name"]
     rows = cypher(Q_ARTICLE_HISTORY, {"law": law, "no": no})
     cur = cypher(Q_CURRENT_ARTICLE_MARKS, {"law": law, "no": no})
-    out = [f"# {law} {no} 개정 연혁"]
+    if not rows and not cur:
+        return article_missing_message(law, no)
+    out = [f"# {law} {no} 개정 연혁", *([note] if (note := resolved_note(res)) else [])]
     if cur:
         marks = re.findall(r"<개정[^>]*>|<신설[^>]*>|\[전문개정[^\]]*\]", cur[0].get("content") or "")
         if marks:
@@ -727,7 +877,7 @@ def t_get_article_history(args: dict) -> str:
             out.append(
                 f"- 시행 {fmt_date(r['enf'])} (적용 구간 {span}) · {flag}"
             )
-    if len(out) == 1:
+    if len(out) == 1 + bool(resolved_note(res)):
         return f"'{law} {no}'의 연혁 정보를 찾지 못함."
     out.append(
         "\n※ 미검증이거나 원천 스냅샷이 없는 버전은 출처 확인된 연혁이 아니다. "
@@ -882,6 +1032,15 @@ def lookup_interp_numbers(no: str) -> list[dict]:
     return hits
 
 
+_CASE_CORE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})\s*-?\s*([가-힣]{1,4})\s*-?\s*(\d{1,7})(?!\d)")
+
+
+def case_core(no: str) -> str:
+    """사건번호의 '연도+부호+번호'(앞 0 제거). 서울고등법원-2015-누-57286 → 2015누57286."""
+    m = _CASE_CORE_RE.search(no or "")
+    return f"{m.group(1)}{m.group(2)}{int(m.group(3))}" if m else ""
+
+
 def lookup_case_numbers(no: str) -> list[dict]:
     want = doc_key(no)
     serial = _serial(no)
@@ -893,12 +1052,121 @@ def lookup_case_numbers(no: str) -> list[dict]:
         "coalesce(c.court_name, c.court_type) AS org LIMIT 3000",
         {"toks": _number_tokens(no)},
     )
+    # 법원명 없이 쓴 법원 사건번호(2015누57286)는 DB의 '서울고등법원-2015-누-57286' 꼴과 핵심 번호로 견준다
+    core = case_core(no) if re.fullmatch(r"\d{4}\s?[가-힣]{1,4}\s?\d{1,7}", no.strip()) else ""
     seen, hits = set(), []
     for r in rows:
-        if doc_key(r.get("no") or "") == want and (r["no"], r.get("d")) not in seen:
+        row_no = r.get("no") or ""
+        same = doc_key(row_no) == want or (
+            core and case_core(row_no) == core and not re.match(r"(?:조심|국심|심사|이의|적부)", row_no))
+        if same and (r["no"], r.get("d")) not in seen:
             seen.add((r["no"], r.get("d")))
             hits.append(r)
     return hits
+
+
+# 심급 연결 — 대법원 판결문 머리의 【원심판결】, 파기환송 뒤 판결문 머리의 "환 송 판 결 … 선고"(src/search/case_lookup.py와 같은 규칙).
+# 대법원만 보면 "파기환송 = 납세자 승소"로 잘못 읽기 쉽다. 2015두41937 은 환송 후 서울고법 2015누57286 이 처분을 취소해 끝났다.
+_LOWER_COURT_RE = re.compile(r"【\s*원\s*심\s*판\s*결\s*】([^【\n]*)")
+_ORDER_RE = re.compile(r"【\s*주\s*문\s*】(.*?)(?:【|$)", re.DOTALL)
+_PLAIN_ORDER_RE = re.compile(r"(?:^|\n)\s*주\s*문\s*\n(.*?)(?:청\s*구\s*취\s*지|항\s*소\s*취\s*지|이\s*유|$)", re.DOTALL)
+_REMAND_COURT_RE = re.compile(r"([가-힣()]+법원)에\s*환송")
+_REMAND_LABEL_RE = re.compile(r"환\s*송\s*판\s*결")
+_CASE_DATE_RE = re.compile(r"(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})")
+_DEFENDANT_RE = re.compile(r"피\s*고[^\n【】]*?(?:】|\s{2,}|\n)\s*([^\n<【]+)")
+_CASE_LINKS: dict = {"at": 0.0, "upper": {}, "remand": {}}
+_CASE_LINKS_LOCK = threading.Lock()
+CASE_LINKS_TTL = 6 * 3600
+CASE_HISTORY_LIMIT = 10
+
+
+def _plain(text: str | None) -> str:
+    text = re.sub(r"<br\s*/?>|</tr\s*>", "\n", text or "", flags=re.IGNORECASE)
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def _order_text(body: str) -> str:
+    m = _ORDER_RE.search(body) or _PLAIN_ORDER_RE.search(body)
+    return clip(re.sub(r"\s+", " ", m.group(1)), 160) if m else ""
+
+
+def _defendant(body: str) -> str:
+    m = _DEFENDANT_RE.search(body)
+    return re.sub(r"\s+", "", m.group(1)) if m else ""
+
+
+def case_links() -> dict:
+    """원심 핵심 번호 → 대법원 판결, 환송한 대법원 번호(또는 환송 날짜) → 환송 후 판결. 6시간마다 다시 읽는다(약 1초)."""
+    with _CASE_LINKS_LOCK:
+        if _CASE_LINKS["upper"] and time.time() - _CASE_LINKS["at"] < CASE_LINKS_TTL:
+            return _CASE_LINKS
+        upper: dict[str, list[dict]] = {}
+        for r in cypher(
+            "MATCH (c:Case) WHERE c.court_name = '대법원' AND coalesce(c.body_identity_status, '') <> 'unresolved' "
+            "RETURN c.case_number AS no, c.ruling_date AS d, left(c.full_content, 700) AS head", {}
+        ):
+            body = _plain(r.get("head"))
+            lower = _LOWER_COURT_RE.search(body)
+            if lower and (key := case_core(lower.group(1))):
+                upper.setdefault(key, []).append({"number": r["no"], "date": fmt_date(r.get("d")), "order": _order_text(body)})
+        remand: dict[str, list[dict]] = {}
+        for r in cypher(
+            "CALL db.index.fulltext.queryNodes('case_content_ft', '\"환 송 판 결\" OR \"환송판결\" OR \"환송 판결\"') YIELD node "
+            "WHERE coalesce(node.body_identity_status, '') <> 'unresolved' "
+            "RETURN node.case_number AS no, coalesce(node.court_name, '') AS court, node.ruling_date AS d, "
+            "left(node.full_content, 1500) AS head", {}
+        ):
+            head = _plain(r.get("head"))
+            label = _REMAND_LABEL_RE.search(head)
+            if not label:
+                continue
+            segment = head[label.end(): label.end() + 80]
+            entry = {"number": r["no"], "court": f"{r['no']} {r['court']}", "date": fmt_date(r.get("d")),
+                     "defendant": _defendant(head), "order": _order_text(head)}
+            if key := case_core(segment):
+                remand.setdefault(key, []).append(entry)
+            elif date := _CASE_DATE_RE.search(segment):
+                y, m, d = date.groups()
+                remand.setdefault(f"{y}{int(m):02d}{int(d):02d}", []).append(entry)
+        _CASE_LINKS.update(at=time.time(), upper=upper, remand=remand)
+        return _CASE_LINKS
+
+
+def case_history(case_id: str) -> dict | None:
+    """법원 판결 한 건의 주문·원심·상고심·환송 후 판결. 판결문 머리 표기로만 잇는다."""
+    rows = cypher(
+        "MATCH (c:Case {case_id: $id}) WHERE coalesce(c.body_identity_status, '') <> 'unresolved' "
+        "RETURN c.case_number AS no, coalesce(c.court_name, '') AS court, c.ruling_date AS d, left(c.full_content, 1500) AS head",
+        {"id": case_id},
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    body, links, out = _plain(r.get("head")), case_links(), {}
+    supreme = r["court"] == "대법원"
+    # 국세청 수록 대법원 문서(대법원-2017-두-66312 꼴, 심리불속행)는 원심 주문을 싣고 있어 【주 문】 머리만 대법원 주문으로 본다
+    order = (clip(re.sub(r"\s+", " ", m.group(1)), 160) if (m := _ORDER_RE.search(body)) else "") if supreme else _order_text(body)
+    if order:
+        out["order"] = order
+    if supreme:
+        if lower := _LOWER_COURT_RE.search(body):
+            out["lower_court"] = clip(re.sub(r"\s+", " ", lower.group(1)), 80)
+        court = _REMAND_COURT_RE.search(out.get("order", ""))
+        if court:
+            date = re.sub(r"\D", "", str(r.get("d") or ""))
+            name = court.group(1)
+            defendant = _defendant(body)
+            found = links["remand"].get(case_core(r["no"])) or [
+                e for e in links["remand"].get(date, [])
+                if (name in e["court"] or name.replace("고등법원", "고법") in e["court"])
+                and not (defendant and e["defendant"] and defendant != e["defendant"])]
+            if found:
+                out["after_remand"] = [{k: e[k] for k in ("number", "date", "order")} for e in found[:2]]
+            else:
+                out["note"] = "파기환송 판결이다. 환송 후 판결은 이 DB에서 찾지 못했다. 파기환송은 최종 결과가 아니다."
+    elif ups := links["upper"].get(case_core(r["no"])):
+        out["supreme_court"] = ups[:2]
+    return out or None
 
 
 def _interp_rows(q: str, limit: int) -> list[dict]:
@@ -921,11 +1189,12 @@ def rank_interpretations(query: str, limit: int) -> list[dict]:
     stems = ko_stems(query)
     title = _interp_rows("interp_title:(" + " ".join(s + "*" for s in stems) + ")", INTERP_POOL) if stems else []
     pool: dict = {}
-    top = max((r["score"] for r in body), default=0) or 1
+    ident = lambda r: r.get("id") or r.get("no") or r.get("title")
+    top = max((r.get("score") or 0 for r in body), default=0) or 1
     for r in body:
-        pool[r["id"]] = {**r, "_body": r["score"] / top, "_title": 0.0}
+        pool[ident(r)] = {**r, "_body": (r.get("score") or 0) / top, "_title": 0.0}
     for r in title:
-        pool.setdefault(r["id"], {**r, "_body": 0.0})["_title"] = min(1.0, r["score"] / len(stems))
+        pool.setdefault(ident(r), {**r, "_body": 0.0})["_title"] = min(1.0, (r.get("score") or 0) / len(stems))
     for r in pool.values():
         if "_title" not in r:
             r["_title"] = 0.0
@@ -943,7 +1212,7 @@ def t_search_interpretations(args: dict) -> str:
     rows = rank_interpretations(query, limit)
     if exact:
         ids = {e["id"] for e in exact}
-        rows = [r for r in rows if r["id"] not in ids]
+        rows = [r for r in rows if r.get("id") not in ids]
         head = cypher(
             f"MATCH (node:Interpretation) WHERE node.interp_id IN $ids AND {interpretation_body_guard('node')} "
             "RETURN true AS exact, node.interp_id AS id, node.interp_title AS title, node.interp_number AS no, node.reply_date AS d, "
@@ -984,13 +1253,255 @@ def t_search_interpretations(args: dict) -> str:
 
 
 
-LAWREF_RE = re.compile(
-    r"((?:[가-힣]+에\s?관한\s?법률|(?:[가-힣]+\s및\s)?[가-힣]*?[가-힣]법)(?:\s?시행령|\s?시행규칙)?)\s*(제\s?\d+\s?조(?:\s?의\s?\d+)?)"
+# 조문 인용 추출 — 조문 번호를 먼저 찾고, 그 앞에서 법령명을 되짚는다.
+# 「법령명」·약칭·붙여쓰기, '같은 법 시행령'·'동법', '제1조, 제2조'·'제3조부터 제5조까지' 열거,
+# '구 소득세법(… 개정되기 전의 것)' 같은 구법 표기를 읽는다. 법령명을 특정 못 한 조문은
+# 조용히 넘기지 않고 unchecked로 돌려준다(검사 안 한 것을 통과로 읽지 않게).
+ARTICLE_TOKEN_RE = re.compile(r"제\s?(\d+)\s?조(?:\s?의\s?(\d+))?(?![의\d])(?:\s?\(([^()\n]{1,60})\))?")
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_SAME_LAW_RE = re.compile(r"(?:같은|동)\s?(법|영|규칙)(\s?시행령|\s?시행규칙)?\s*$")
+_CONNECTOR_RE = re.compile(
+    r"(?:\s|,|·|ㆍ|및|와|과|또는|내지|부터|까지|~|∼|-|의|제\s?\d+\s?(?:항|호|목)|단서|본문|전단|후단|각\s?호|외의|부분)*"
 )
+_NOT_LAW_WORDS = {"방법", "입법", "적법", "위법", "불법", "편법", "해법", "수법", "용법", "문법", "어법", "화법", "이법", "본법"}
+_LAW_SUFFIX = re.compile(r"(?:시행령|시행규칙)$")
+CITE_LIMIT = 60
+
+
+def _law_base(name: str) -> str:
+    return re.sub(r"\s?(?:시행령|시행규칙)$", "", name)
+
+
+def _tail_law(window: str) -> tuple[str | None, dict | None, bool]:
+    """창 끝의 법령명 → (원문 표기, 해석 결과, 구법 여부). 법령 모양이 아니면 (None, None, False)."""
+    m = re.search(r"「([^」\n]{1,80})」\s*$", window)
+    if m:
+        old = bool(re.search(r"(?:^|[\s(])구\s?$", window[: m.start()]))
+        return m.group(1), resolve_law(m.group(1), partial=False), old
+    words = window.split()
+    for k in range(min(len(words), 8), 0, -1):
+        cand = " ".join(words[-k:]).lstrip("([『\"'“‘,· ").strip()
+        old = False
+        if k < len(words) and words[-k - 1] == "구":
+            old = True
+        res = resolve_law(cand, partial=False)
+        if res["status"] == "not_found" and cand.startswith("구") and len(cand) > 2:
+            res2 = resolve_law(cand[1:], partial=False)
+            if res2["status"] != "not_found":
+                res, old = res2, True
+        if res["status"] != "not_found":
+            return cand, res, old
+    last = words[-1].lstrip("([『\"'“‘,· ") if words else ""
+    if re.search(r"(?:법|법률|시행령|시행규칙|규정)$", last) and last not in _NOT_LAW_WORDS and len(last) >= 2:
+        prev = words[-2] if len(words) >= 2 and _LAW_SUFFIX.search(last) else ""
+        raw = f"{prev} {last}".strip() if prev else last
+        return raw, {"status": "not_found", "input": raw}, False
+    return None, None, False
+
+
+def extract_article_citations(text: str) -> tuple[list[dict], list[str]]:
+    cites, unresolved = [], []
+    prev_end, prev = 0, None  # prev: {"raw","res","old"}
+    for m in ARTICLE_TOKEN_RE.finditer(text):
+        window = text[max(prev_end, m.start() - 160): m.start()]
+        if re.search(r"\n\s*\n", window):
+            prev = None
+            window = re.split(r"\n\s*\n", window)[-1]
+        bare = window
+        while _TRAILING_PAREN_RE.search(bare):
+            bare = _TRAILING_PAREN_RE.sub("", bare)
+        bare = bare.rstrip()
+        same = _SAME_LAW_RE.search(bare)
+        cur = None
+        if same:
+            if prev and prev["res"]["status"] == "ok":
+                kind, suffix = same.group(1), (same.group(2) or "").strip()
+                base = _law_base(prev["res"]["name"])
+                name = base + (" 시행령" if kind == "영" else " 시행규칙" if kind == "규칙" else (f" {suffix}" if suffix else ""))
+                cur = {"raw": same.group(0).strip(), "res": resolve_law(name, partial=False), "old": prev["old"]}
+        else:
+            raw, res, old = _tail_law(bare)
+            if res is not None:
+                cur = {"raw": raw, "res": res, "old": old}
+            elif prev and _CONNECTOR_RE.fullmatch(bare.strip()):
+                cur = prev
+        no = f"제{m.group(1)}조" + (f"의{m.group(2)}" if m.group(2) else "")
+        prev_end = m.end()
+        if cur is None:
+            snippet = clip(text[max(0, m.start() - 12): m.end()], 40)
+            unresolved.append(snippet)
+            prev = None
+            continue
+        prev = cur
+        title = (m.group(3) or "").strip()
+        if re.search(r"\d|이하|개정|의 것|단서|본문|^각", title):
+            title = ""  # 날짜·약칭 정의·'개정되기 전의 것' 같은 괄호는 조문 제목이 아니다
+        cites.append({"raw": cur["raw"], "res": cur["res"], "old": cur["old"], "no": no, "title": title,
+                      "evidence": window})
+    return cites, unresolved
+
+
+def title_matches(cited: str, actual: str) -> bool:
+    norm = lambda t: re.sub(r"[\s·ㆍ‧•・,()\[\]「」'\"]", "", t or "")
+    a, b = norm(cited), norm(actual)
+    if not a or not b:
+        return True
+    if a == b or (len(a) >= 3 and a in b) or (len(b) >= 3 and b in a):
+        return True
+    ga, gb = _bigrams(a), _bigrams(b)
+    return bool(ga and gb) and 2 * len(ga & gb) / (len(ga) + len(gb)) >= 0.6
+
+
+RENUMBER_REASONS = {
+    "renumbered_by_full_revision": "그 뒤 전부개정으로 번호 체계가 바뀌어 현행 조문과 1:1로 잇지 못했다",
+    "renumbered_target_gone": "그 뒤 개정으로 조문이 옮겨졌는데 어디로 갔는지 확정하지 못했다",
+    "predates_numbering_epoch": "번호 대응표 수록 시작 전의 번호다",
+    "former_edition_unknown": "'구'만 있고 어느 판인지 밝히지 않았는데 최근 15년 안에 이 번호가 가리키는 조문이 바뀐 적이 있다",
+}
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y%m%d")  # noqa: DTZ005 - 서버는 한국 시각으로 돈다
+
+
+def _before(date: str) -> str:
+    return f"({date[:4]}. {int(date[4:6])}. {int(date[6:8])}. 개정되기 전의 것)"
+
+
+def renumber_old_citation(law: str, no: str, evidence: str):
+    """구법·옛 이름 인용 → 대응표의 Resolution. 대응표에 없는 법령이면 None."""
+    table = load_renumbering()
+    if not table or not table.covers(law):
+        return None
+    return table.resolve(law, no, _today(), evidence, former=True)
+
+
+MOVE_NOTICE_YEARS = 10
+
+
+def _ro(no: str) -> str:
+    """조문 번호 뒤 조사 — 제97조의10'으로'·제80조의2'로'·제2조'로'."""
+    return "으로" if no and no[-1] in "013678" else "로"
+
+
+def _eul(no: str) -> str:
+    return "을" if no and no[-1] in "013678" else "를"
+
+
+def moved_away_hint(law: str, no: str, recent_years: int | None = None):
+    """현행 번호로 쓴 인용이 옛 판 번호일 가능성 — 이 번호의 조문이 가장 최근 옮겨 간 곳.
+    recent_years를 주면 그 기간 안에 옮겨 간 경우만(오래전 이동까지 알리면 거의 모든 인용에 붙는다)."""
+    table = load_renumbering()
+    if not table or not table.covers(law):
+        return None
+    since = f"{int(_today()[:4]) - recent_years}{_today()[4:]}" if recent_years else ""
+    events = [e for e in table.laws[law]["events"] if no in e.get("moves", {}) and e["date"] >= since]
+    if not events:
+        return None
+    last = events[-1]
+    res = table.resolve(law, no, _today(), _before(last.get("promulgated") or last["date"]), former=True)
+    if res.number and res.number != no:
+        return {"moved_to": res.number, "moved_on": fmt_date(last["date"])}
+    return None
+
+
+def _current_title(law: str, no: str) -> str | None:
+    rows = cypher(q_current_article("l.law_name = $law"), {"law": law, "no": no})
+    return (rows[0]["title"] or "") if rows else None
+
+
+def _apply_renumbering(item: dict, c: dict, law: str, evidence: str) -> dict | None:
+    """옛 번호를 현행 번호로 옮겨 대조. 옮길 수 없으면 unchecked로 채운 item, 대응표 밖이면 None."""
+    moved = renumber_old_citation(law, c["no"], evidence)
+    if moved is None:
+        return None
+    if moved.number is None:
+        item.update(status="unchecked", reason=moved.reason, law=law,
+                    note="옛 번호 인용인데 " + RENUMBER_REASONS.get(moved.reason, "현행 번호로 옮기지 못했다") + ".")
+        return item
+    if moved.number == c["no"] and moved.reason == "":
+        return None  # 번호가 그대로 — 현행 조문으로 대조
+    title = _current_title(law, moved.number)
+    item.update(status="found" if title is not None else "unchecked", law=law, current_number=moved.number,
+                renumber_path=list(moved.path))
+    if moved.reason == "deleted_since":
+        item["note"] = f"옛 판의 {c['no']}는 그 뒤 삭제되어 현행 {moved.number}는 삭제 자리다."
+    else:
+        item["title"] = title
+        item["note"] = f"옛 판의 {c['no']}는 현행 {moved.number}{_ro(moved.number)} 옮겨졌다(경로 {' → '.join(moved.path)})."
+        if c["title"] and title:
+            item["title_check"] = "match" if title_matches(c["title"], title) else "mismatch"
+    return item
+
+
+def check_article_citation(c: dict) -> dict:
+    res, no = c["res"], c["no"]
+    label = f"{c['raw']} {no}" + (f"({c['title']})" if c["title"] else "")
+    item = {"citation": label}
+    if c["old"]:
+        item["old_version"] = True
+    if res["status"] == "former":
+        item.update(current_law=res["current"])
+        done = _apply_renumbering(item, c, res["current"], c.get("evidence", "") + _before(res["date"]))
+        if done is not None:
+            done["note"] = f"옛 법령명({c['raw']}) 인용. " + done.get("note", "")
+            return done
+        item.update(status="unchecked", reason="former_law_name",
+                    note=f"옛 법령명 인용. {fmt_date(res['date'])} 이름이 바뀌기 전 번호라 현행 「{res['current']}」 조문과 대조하지 않았다.")
+        return item
+    if res["status"] != "ok":
+        item.update(status="not_found", reason="law_not_in_db",
+                    note="이 DB(세법)에 없는 법령명이다. 지어낸 이름이거나 세법 밖 법령(민법·형법 등)일 수 있다.")
+        return item
+    law = res["name"]
+    if c["old"] and (done := _apply_renumbering(item, c, law, c.get("evidence", ""))) is not None:
+        return done
+    rows = cypher(q_current_article("l.law_name = $law"), {"law": law, "no": norm_article_no(no)})
+    if not rows:
+        info = article_range(law, no)
+        if not c["old"] and (hint := moved_away_hint(law, no)):
+            item["moved_hint"] = hint
+            item["note"] = (f"현행에는 {no}가 없지만, 이 번호의 조문은 {hint['moved_on']} 개정으로 {hint['moved_to']}{_ro(hint['moved_to'])} 옮겨졌다. "
+                            "옛 번호를 쓴 것일 수 있다.")
+        if c["old"]:
+            item.update(status="unchecked", reason="old_version_article", law=law,
+                        note="구법 인용인데 현행에는 이 번호가 없다. 당시 조문은 get_article_history·law.go.kr 연혁으로 확인.")
+        else:
+            item.update(status="not_found", reason="article_not_in_current_law", law=law)
+        if info:
+            item["current_range"] = info["range"]
+            if info["siblings"]:
+                item["same_base_articles"] = info["siblings"]
+        return item
+    r = rows[0]
+    item.update(status="found", law=r["law"], title=r["title"], enforcement_date=fmt_date(r["enf"]))
+    if res.get("how") in ("alias", "nospace"):
+        item["resolved_from"] = c["raw"]
+    if c["title"]:
+        ok = title_matches(c["title"], r["title"] or "")
+        item["title_check"] = "match" if ok else "mismatch"
+        if not ok:
+            item["note"] = (f"조문은 있지만 인용한 제목 '{c['title']}'이 현행 제목 '{r['title']}'과 다르다."
+                            + (" 구법 인용이면 당시 제목이었을 수 있다." if c["old"] else " 다른 조문을 가리켰을 가능성이 있다."))
+            if not c["old"] and (hint := moved_away_hint(law, no)):
+                moved_title = _current_title(law, hint["moved_to"])
+                if moved_title and title_matches(c["title"], moved_title):
+                    item["moved_hint"] = {**hint, "title": moved_title}
+                    item["note"] += (f" 이 번호의 옛 조문은 {hint['moved_on']} 개정으로 {hint['moved_to']}({moved_title}){_ro(hint['moved_to'])} 옮겨졌다. "
+                                     "옛 번호를 쓴 것으로 보인다.")
+    elif c["old"]:
+        item["note"] = "구법 인용을 현행 조문으로 대조했다. 당시 조문 내용은 다를 수 있다."
+    elif (hint := moved_away_hint(law, no, recent_years=MOVE_NOTICE_YEARS)):
+        # 제목 없이 쓴 번호가 최근 개정으로 다른 조문을 가리키게 됐다 — 옛 지식으로 쓴 초안이 흔히 걸린다
+        moved_title = _current_title(law, hint["moved_to"])
+        item["moved_hint"] = {**hint, "title": moved_title}
+        item["note"] = (f"이 번호의 옛 조문{f'({moved_title})' if moved_title else ''}은 {hint['moved_on']} 개정으로 "
+                        f"{hint['moved_to']}{_ro(hint['moved_to'])} 옮겨졌고, 지금 {no}는 '{r['title']}'이다. 그 전 판을 기준으로 쓴 인용이면 {hint['moved_to']}{_eul(hint['moved_to'])} 볼 것.")
+    return item
 
 
 def t_verify_citations(args: dict) -> dict:
-    """초안에 적힌 해석례·판례·결정례 문서번호와 '법령명 제N조'가 이 DB에 실제로 있는지 확인한다."""
+    """초안에 적힌 해석례·판례·결정례 문서번호와 조문 인용이 이 DB에 실제로 있는지, 괄호 제목이 맞는지 확인한다."""
     text = str(args.get("text") or "")[:20000]
     docs = []
     for m in dict.fromkeys(x.group(0).strip() for x in INTERP_NO_RE.finditer(text)):
@@ -999,34 +1510,66 @@ def t_verify_citations(args: dict) -> dict:
                      "matches": [{"number": h["no"], **({"official_number": h["src"]} if h.get("src") and doc_key(h["src"]) not in interp_number_keys(h["no"]) else {}),
                                   "title": h.get("title"), "date": fmt_date(h.get("d")), "org": h.get("org")}
                                  for h in hits[:3]]})
+    histories = 0
     for m in dict.fromkeys(x.group(0).strip() for x in CASE_NO_RE.finditer(text)):
         hits = lookup_case_numbers(m)
-        docs.append({"citation": m, "kind": "case", "status": "found" if hits else "not_found",
-                     "matches": [{"number": h["no"], "title": h.get("title"), "date": fmt_date(h.get("d")), "court": h.get("org")}
-                                 for h in hits[:3]]})
-    arts = []
-    for law, no in dict.fromkeys((a.strip(), re.sub(r"\s", "", b)) for a, b in LAWREF_RE.findall(text)):
-        rows = cypher(q_current_article("replace(l.law_name, ' ', '') = $law"), {"law": re.sub(r"\s", "", law), "no": norm_article_no(no)})
-        arts.append({"citation": f"{law} {no}", "status": "found" if rows else "not_found",
-                     **({"law": rows[0]["law"], "title": rows[0]["title"], "enforcement_date": fmt_date(rows[0]["enf"])} if rows else {})})
-    docs, arts = docs[:40], arts[:40]
-    bad = [d["citation"] for d in docs + arts if d["status"] != "found"]
-    return {
+        matches = []
+        for h in hits[:3]:
+            match = {"number": h["no"], "title": h.get("title"), "date": fmt_date(h.get("d")), "court": h.get("org")}
+            if str(h.get("org") or "").endswith("법원") and histories < CASE_HISTORY_LIMIT:
+                histories += 1
+                if history := case_history(h["id"]):
+                    match["history"] = history
+            matches.append(match)
+        docs.append({"citation": m, "kind": "case", "status": "found" if hits else "not_found", "matches": matches})
+    cites, unresolved = extract_article_citations(text)
+    seen, arts, over = set(), [], 0
+    for c in cites:
+        key = (c["res"].get("name") or c["res"].get("input") or c["raw"], c["no"], c["title"], c["old"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(arts) >= CITE_LIMIT:
+            over += 1
+            continue
+        arts.append(check_article_citation(c))
+    docs = docs[:40]
+    bad = [d["citation"] for d in docs + arts if d["status"] == "not_found"]
+    mismatch = [a["citation"] for a in arts if a.get("title_check") == "mismatch"]
+    unchecked = [a["citation"] for a in arts if a["status"] == "unchecked"]
+    found = sum(1 for d in docs + arts if d["status"] == "found")
+    summary = (f"문서번호 {len(docs)}건 · 조문 {len(arts)}건 검사: 있음 {found}건, 없음 {len(bad)}건"
+               + (f", 제목 불일치 {len(mismatch)}건" if mismatch else "")
+               + (f", 대조 못 함 {len(unchecked)}건" if unchecked else "")
+               + (f", 법령명을 특정하지 못해 검사하지 않은 조문 표기 {len(unresolved)}건" if unresolved else "")
+               + (f", 상한 {CITE_LIMIT}건을 넘어 검사하지 않은 조문 {over}건" if over else ""))
+    out = {
         "documents": docs,
         "articles": arts,
-        "summary": f"문서번호 {len(docs)}건 · 조문 {len(arts)}건 중 이 DB에서 확인 안 된 것 {len(bad)}건",
+        "summary": summary,
         "not_found": bad,
         "notice": ("found는 같은 번호의 문서·현행 조문이 있다는 뜻일 뿐, 인용한 내용이 그 문서·조문과 맞는지는 "
-                   "get_evidence·get_article로 본문을 확인해야 한다. not_found는 지어낸 번호일 수도, 이 DB 미수록일 수도 있다"
-                   "(형사·민사 판결, 최근 공개분, 폐지·이동 조문). 조문은 현행 버전 기준이다."),
+                   "get_evidence·get_article로 본문을 확인해야 한다. 조문 뒤 괄호 제목은 현행 제목과 대조해 title_check로 표시한다. "
+                   "not_found는 지어낸 번호일 수도, 이 DB 미수록일 수도 있다"
+                   "(형사·민사 판결, 최근 공개분, 폐지·이동 조문). 조문은 현행 버전 기준이다. "
+                   "unchecked·unresolved_articles는 검사하지 못한 것이지 통과한 것이 아니다. "
+                   "판례 history(주문·원심·상고심·환송 후 판결)는 판결문 머리 표기로 이은 것이라, 없다고 상급심이 없다는 뜻은 아니다. "
+                   "옛 번호 인용은 법제처 개정문 대응표로 현행 번호를 찾아 current_number로 준다."),
     }
+    if mismatch:
+        out["title_mismatch"] = mismatch
+    if unchecked:
+        out["unchecked"] = unchecked
+    if unresolved:
+        out["unresolved_articles"] = unresolved[:20]
+    return out
 
 
 # ---------------------------------------------------------------- 별표·시행예정
 
 def t_search_annexes(args: dict) -> str:
     q = lucene_escape(str(args["query"]))
-    law = args.get("law_name")
+    law = law_filter(args.get("law_name"))
     limit = min(int(args.get("limit", 5)), 15)
     rows = cypher(Q_SEARCH_ANNEXES, {"q": q, "law": law, "limit": limit})
     if not rows:
@@ -1046,7 +1589,7 @@ def t_search_annexes(args: dict) -> str:
 
 
 def t_get_annex(args: dict) -> str:
-    law = str(args["law_name"]).strip()
+    law = law_filter(args["law_name"])  # 약칭·띄어쓰기만 정식 이름으로. '소득세법 별표 2'처럼 시행령 별표를 찾는 부분 일치는 유지
     no = str(args["annex_number"]).strip()
     if not re.match(r"^(별표|서식)", no):
         no = f"별표 {no.lstrip('제').rstrip('호')}".strip()
@@ -1080,7 +1623,7 @@ def t_get_annex(args: dict) -> str:
 
 
 def t_list_upcoming(args: dict) -> str:
-    law = args.get("law_name")
+    law = law_filter(args.get("law_name"))
     rows = cypher(
         "MATCH (u:UpcomingVersion) WHERE ($law IS NULL OR u.law_name CONTAINS $law) "
         "RETURN u.law_name AS law, u.enforcement_date AS d, u.revision_type AS kind, "
@@ -1361,12 +1904,66 @@ def t_get_treaty_article(args: dict) -> str:
     return "\n".join(out)
 
 
+DEFAULT_INTENTS = ("law", "case", "ruling")
+
+
+def _normalize_date(value):
+    """'2024.12.31'·'2024. 12. 31.'·'2024/12/31'·'2024년 12월 31일' → '2024-12-31'. 모르는 꼴은 그대로 둬 원래 오류를 낸다."""
+    if not isinstance(value, str):
+        return value
+    parts = re.findall(r"\d+", value)
+    if len(parts) == 3 and len(parts[0]) == 4 and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return f"{parts[0]}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+    return value.strip()
+
+
+def coerce_search_args(args: dict) -> dict:
+    """클라이언트가 자주 틀리는 인자 꼴을 받아 준다(10월 bad_args 실측).
+    search_intents를 JSON 문자열('["law"]')·유형 이름 배열로 보내고 검색어를 query에 둔 경우,
+    search_intents 없이 query만 보낸 경우, 유형별 값을 배열 대신 문자열로 보낸 경우."""
+    a = dict(args)
+    query = a.pop("query", None)
+    query = str(query).strip()[:300] if isinstance(query, str | int | float) and str(query).strip() else None
+    intents = a.get("search_intents")
+    if isinstance(intents, str):
+        text = intents.strip()
+        try:
+            intents = json.loads(text if '"' in text or "'" not in text else text.replace("'", '"'))
+        except ValueError:
+            intents = [t for t in re.split(r"[,\s]+", text) if t] if all(
+                t in INTENT_TYPES for t in re.split(r"[,\s]+", text) if t) else text
+    if isinstance(intents, str) and intents.strip() and query is None:
+        query, intents = intents.strip()[:300], None  # 유형 없이 검색어만 문자열로 온 경우
+    if isinstance(intents, list) and intents and all(isinstance(t, str) and t in INTENT_TYPES for t in intents):
+        if not query:
+            raise ValueError("search_intents는 유형별 검색어 객체입니다. 예: {\"law\": [\"소득세법 제97조의2\"], \"case\": [\"이월과세\"]}")
+        intents = {t: [query] for t in dict.fromkeys(intents)}
+    if intents is None and query:
+        intents = {t: [query] for t in DEFAULT_INTENTS}
+    if isinstance(intents, dict):
+        intents = {k: ([v] if isinstance(v, str) else v) for k, v in intents.items()}
+    if intents is not None:
+        a["search_intents"] = intents
+    if "as_of" in a:
+        a["as_of"] = _normalize_date(a["as_of"])
+    return a
+
+
 def t_search_tax(args: dict) -> dict:
-    return PublicGraphSearch(cypher).search(args)
+    return PublicGraphSearch(cypher).search(coerce_search_args(args))
 
 
 def t_get_evidence(args: dict) -> dict:
-    return PublicGraphSearch(cypher).get_evidence(args)
+    a = dict(args)
+    for alias in ("id", "evidence", "document_id"):
+        if not a.get("evidence_id") and a.get(alias):
+            a["evidence_id"] = a.pop(alias)
+        else:
+            a.pop(alias, None)
+    if not a.get("evidence_id") or not a.get("evidence_type"):
+        raise ValueError("get_evidence에는 search_tax 결과 항목의 evidence_type과 evidence_id를 그대로 넣어야 합니다. "
+                         "문서번호·사건번호만 알면 search_interpretations·search_cases·verify_citations로 먼저 찾으세요.")
+    return PublicGraphSearch(cypher).get_evidence(a)
 
 
 TOOLS = [
@@ -1397,7 +1994,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "law_name": {"type": "string", "description": "법령명 (예: '소득세법', '상속세 및 증여세법')"},
+                "law_name": {"type": "string", "description": "법령명 (예: '소득세법', '상속세 및 증여세법'). 약칭(조특법·상증법·국기법)·띄어쓰기 차이도 받는다"},
                 "article_number": {"type": "string", "description": "조번호 (예: '제97조의2', '97조의2', '55')"},
             },
             "required": ["law_name", "article_number"],
@@ -1449,7 +2046,7 @@ TOOLS = [
     },
     {
         "name": "verify_citations",
-        "description": "답변·의견서 초안에 적힌 해석례·판례·결정례 문서번호(예: 서면-2023-법규기본-2595, 기획재정부 소득세제과-1059, 2015두41937, 조심2023서1234)와 '법령명 제N조' 인용이 이 DB에 실제로 있는지 확인한다. 지어낸 번호·없는 조문을 거르는 용도이며, 존재 확인일 뿐 내용 일치 확인이 아니다.",
+        "description": "답변·의견서 초안에 적힌 해석례·판례·결정례 문서번호(예: 서면-2023-법규기본-2595, 기획재정부 소득세제과-1059, 2015두41937, 조심2023서1234)와 조문 인용이 이 DB에 실제로 있는지 확인한다. 「법령명」·약칭(조특법·상증법)·'같은 법 시행령'·'제1조, 제2조' 열거를 읽고, 조문 뒤 괄호 제목은 현행 제목과 대조한다(title_check). 지어낸 번호·없는 조문·엉뚱한 제목을 거르는 용도이며, 본문 내용 일치 확인은 아니다. unchecked·unresolved_articles는 검사 못 한 것이다.",
         "inputSchema": {
             "type": "object",
             "properties": {"text": {"type": "string", "description": "검증할 초안 본문 또는 문서번호 목록"}},
@@ -1584,6 +2181,9 @@ TOOLS.extend([
         "fn": t_get_evidence,
     },
 ])
+READ_ONLY_ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+for _tool in TOOLS:  # 전부 DB 읽기 전용 — 클라이언트·디렉터리 심사가 확인 없이 부를 수 있게
+    _tool["annotations"] = {**READ_ONLY_ANNOTATIONS, **_tool.get("annotations", {})}
 TOOL_MAP = {t["name"]: t for t in TOOLS}
 
 # ---------------------------------------------------------------- rate limit / 로그
@@ -1601,6 +2201,14 @@ def ip_blocked(ip: str) -> bool:
 
 _rate_lock = threading.Lock()
 _rate: dict[str, deque] = defaultdict(deque)
+
+
+def rate_retry_after(ip: str, bucket: str = "call") -> int:
+    """한도에 걸린 IP가 다음 호출을 할 수 있을 때까지 남은 초(1분 창의 가장 오래된 호출이 빠지는 시각)."""
+    with _rate_lock:
+        q = _rate.get(f"{bucket}:{ip}")
+        oldest = q[0] if q else time.time()
+    return max(1, int(60 - (time.time() - oldest)) + 1)
 
 
 def rate_ok(ip: str, bucket: str = "call", limit: int = RATE_PER_MIN) -> bool:
@@ -1715,7 +2323,10 @@ def handle_message(msg: dict, ip: str, ua: str = ""):
         ip, "handshake", HANDSHAKE_PER_MIN
     ):
         log_usage(ip, method, "", 0, "rate_limited", ua)
-        return rpc_error(id_, -32000, "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요.")
+        wait = rate_retry_after(ip, "handshake")
+        error = rpc_error(id_, -32000, f"요청이 너무 잦습니다. {wait}초 뒤 다시 시도해 주세요.")
+        error["error"]["data"] = {"retry_after_seconds": wait}
+        return error
 
     if method == "initialize":
         client_proto = str(params.get("protocolVersion", DEFAULT_PROTOCOL))
@@ -1750,11 +2361,13 @@ def handle_message(msg: dict, ip: str, ua: str = ""):
             return rpc_error(id_, -32602, f"알 수 없는 도구: {name}")
         if not rate_ok(ip):
             log_usage(ip, "tools/call", name, 0, "rate_limited", ua)
+            wait = rate_retry_after(ip)
             return {
                 "jsonrpc": "2.0", "id": id_,
                 "result": {"content": [{"type": "text",
-                           "text": "호출 한도 초과(분당 30회). 잠시 후 다시 시도해 주세요."}],
-                           "isError": True},
+                           "text": f"호출 한도 초과(IP당 분당 {RATE_PER_MIN}회). {wait}초 뒤 다시 시도하세요. "
+                                   "같은 내용을 여러 번 나눠 부르지 말고 search_tax 한 번에 검색 의도를 묶으면 호출이 줄어듭니다."}],
+                           "isError": True, "_meta": {"retry_after_seconds": wait}},
             }
         output = None
         try:
