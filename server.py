@@ -56,7 +56,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -197,6 +197,15 @@ def clip(s, n=300) -> str:
 # 부분 일치는 같은 법령 묶음(법·시행령·시행규칙)일 때만 받고, 다른 법령이 섞이면 후보를 돌려준다.
 # 옛 이름(상속세법·조세감면규제법)은 전부개정 전 번호라 현행 조문으로 풀지 않는다.
 
+# 실무에서 쓰는 시행령·시행규칙 줄임말. 공유 약칭표(law_aliases.py)는 판례·해석 원문 연결용이라 뺀 꼴인데,
+# 초안 검증 입력에는 흔하다(실제 답변 실측 '조특령'). '법령'·'부령'·'소령'처럼 일반 낱말과 겹치는 꼴은 넣지 않는다.
+EXTRA_ALIASES: dict[str, tuple[str, ...]] = {
+    "조세특례제한법 시행령": ("조특령",), "조세특례제한법 시행규칙": ("조특칙",),
+    "상속세 및 증여세법 시행령": ("상증령", "상증세령"), "상속세 및 증여세법 시행규칙": ("상증칙",),
+    "법인세법 시행령": ("법인령",), "소득세법 시행령": ("소득령",), "부가가치세법 시행령": ("부가령",),
+    "국세기본법 시행령": ("국기령",), "국제조세조정에 관한 법률 시행령": ("국조령",),
+}
+
 _DOTS = re.compile(r"[\s·ㆍ‧•・「」『』]")
 _LAW_CACHE: dict = {"at": 0.0, "names": [], "keys": {}}
 _LAW_CACHE_TTL = 600
@@ -215,7 +224,7 @@ def _law_index() -> tuple[list[str], dict[str, str]]:
         )
         names = sorted({r["name"] for r in rows if r.get("name")})
         keys = {}
-        for official, aliases in PRACTICE_ALIASES.items():
+        for official, aliases in [*PRACTICE_ALIASES.items(), *EXTRA_ALIASES.items()]:
             if official in names:
                 for a in aliases:
                     keys[law_key(a)] = official
@@ -1257,51 +1266,104 @@ def t_search_interpretations(args: dict) -> str:
 # 「법령명」·약칭·붙여쓰기, '같은 법 시행령'·'동법', '제1조, 제2조'·'제3조부터 제5조까지' 열거,
 # '구 소득세법(… 개정되기 전의 것)' 같은 구법 표기를 읽는다. 법령명을 특정 못 한 조문은
 # 조용히 넘기지 않고 unchecked로 돌려준다(검사 안 한 것을 통과로 읽지 않게).
-ARTICLE_TOKEN_RE = re.compile(r"제\s?(\d+)\s?조(?:\s?의\s?(\d+))?(?![의\d])(?:\s?\(([^()\n]{1,60})\))?")
+# 번호 뒤 '의'는 조사일 수 있다("제107조의 요건", "제5조의3의 규정") — 숫자가 바로 이어질 때만 가지번호로 읽는다
+# 가지번호는 3자리까지, 뒤에 단위가 붙으면("제94조의 2026년", "제5조의 3가지") 가지번호가 아니다.
+# 실무 메모의 '§52'·'§18의2'도 읽는다. '제' 없이 쓴 '52조'는 금액(3조 원)과 섞이므로 법령명 바로 뒤에서만 받는다.
+ARTICLE_TOKEN_RE = re.compile(
+    r"(?:제\s?(?P<n>\d+)\s?조|§\s?(?P<s>\d+)|(?<![\d,.제§])(?P<b>\d{1,3})조(?=\s?의\s?\d|[^가-힣]|$))"
+    r"(?:\s?의\s?(?P<br>\d{1,3})(?!\d|\s?(?:년|월|일|개|가지|차|회|번|명|건|배|%|억|만|천|원|분의)))?(?!\d)"
+    r"(?:\s?\((?P<t>[^()\n]{1,60})\))?")
 _TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
-_SAME_LAW_RE = re.compile(r"(?:같은|동)\s?(법|영|규칙)(\s?시행령|\s?시행규칙)?\s*$")
+_SAME_LAW_RE = re.compile(r"(?:같은|동)\s?(법|영|규칙|시행령|시행규칙)(\s?시행령|\s?시행규칙)?\s*$")
 _CONNECTOR_RE = re.compile(
     r"(?:\s|,|·|ㆍ|및|와|과|또는|내지|부터|까지|~|∼|-|의|제\s?\d+\s?(?:항|호|목)|단서|본문|전단|후단|각\s?호|외의|부분)*"
 )
 _NOT_LAW_WORDS = {"방법", "입법", "적법", "위법", "불법", "편법", "해법", "수법", "용법", "문법", "어법", "화법", "이법", "본법"}
-_LAW_SUFFIX = re.compile(r"(?:시행령|시행규칙)$")
-CITE_LIMIT = 60
+CITE_LIMIT = 120
+LAW_NAME_MAX_WORDS = 16  # 가장 긴 수록 법령명이 14어절(농ㆍ축산ㆍ임ㆍ어업용 … 특례규정 시행규칙)
 
 
 def _law_base(name: str) -> str:
     return re.sub(r"\s?(?:시행령|시행규칙)$", "", name)
 
 
+_WORD_BREAK = re.compile(r"[(\[（「『\"'“‘*,:;/→|>]")
+# 법령명 없이 '법 제39조'·'시행령 제154조'·'영 제28조'·'현행 시행규칙 제22조'로 쓴 꼴 — 앞에 나온 법령을 가리킨다
+_CONTEXT_WORD_RE = re.compile(r"(?:^|(?<![가-힣]))(구|현행|종전|개정|당시)?\s?(법|법률|시행령|영|시행규칙|규칙)$")
+_CONTEXT_WORDS = {"법", "법률", "시행령", "영", "시행규칙", "규칙", "구법", "개정법률", "개정법", "현행법", "종전법"}
+# 법령이 아닌 문서의 조문 — 앞 법령으로 넘겨짚지 않는다
+_OTHER_DOCUMENT_RE = re.compile(r"(?:부칙|조약|협약|협정|의정서|정관|약관|계약서|계약|규정|고시|훈령|지침|조례|통칙|준칙|기준|헌법|예규)$")
+_TAX_NAME_RE = re.compile(r"세법|조세|과세|관세|국세|지방세|세액|세특례")
+_CITE_MARKER_RE = re.compile(r"\[[a-z]+-[^\[\]\n]*(?:\[[^\[\]\n]*\])?[^\[\]\n]*\]")
+
+
 def _tail_law(window: str) -> tuple[str | None, dict | None, bool]:
     """창 끝의 법령명 → (원문 표기, 해석 결과, 구법 여부). 법령 모양이 아니면 (None, None, False)."""
     m = re.search(r"「([^」\n]{1,80})」\s*$", window)
     if m:
-        old = bool(re.search(r"(?:^|[\s(])구\s?$", window[: m.start()]))
+        old = bool(re.search(r"(?:^|[\s(])(?:구|舊)\s?$", window[: m.start()]))
         return m.group(1), resolve_law(m.group(1), partial=False), old
-    words = window.split()
-    for k in range(min(len(words), 8), 0, -1):
-        cand = " ".join(words[-k:]).lstrip("([『\"'“‘,· ").strip()
+    words = _WORD_BREAK.sub(" ", window).split()
+    for k in range(min(len(words), LAW_NAME_MAX_WORDS), 0, -1):
+        cand = " ".join(words[-k:]).strip("· ")
         old = False
-        if k < len(words) and words[-k - 1] == "구":
+        if k < len(words) and words[-k - 1] in ("구", "舊"):
             old = True
         res = resolve_law(cand, partial=False)
-        if res["status"] == "not_found" and cand.startswith("구") and len(cand) > 2:
+        if res["status"] == "not_found" and cand[:1] in ("구", "舊") and len(cand) > 2:
             res2 = resolve_law(cand[1:], partial=False)
             if res2["status"] != "not_found":
                 res, old = res2, True
         if res["status"] != "not_found":
             return cand, res, old
-    last = words[-1].lstrip("([『\"'“‘,· ") if words else ""
-    if re.search(r"(?:법|법률|시행령|시행규칙|규정)$", last) and last not in _NOT_LAW_WORDS and len(last) >= 2:
-        prev = words[-2] if len(words) >= 2 and _LAW_SUFFIX.search(last) else ""
-        raw = f"{prev} {last}".strip() if prev else last
+    last = words[-1].strip("· ") if words else ""
+    before = words[-2].strip("· ") if len(words) >= 2 else ""
+    if last in ("시행령", "시행규칙") and _looks_like_law(before):
+        raw = f"{before} {last}"  # '증여세법 시행령'처럼 법령 모양인데 DB에 없는 이름
         return raw, {"status": "not_found", "input": raw}, False
+    if last not in _CONTEXT_WORDS and _looks_like_law(last):
+        return last, {"status": "not_found", "input": last}, False
     return None, None, False
 
 
+def _looks_like_law(word: str) -> bool:
+    return (len(word) >= 2 and bool(re.search(r"(?:법|법률)$", word))
+            and word not in _NOT_LAW_WORDS and word not in _CONTEXT_WORDS)
+
+
+def _last_law_mention(before: str) -> dict | None:
+    """조문 없이 언급만 된 법령("법인세법상 …(법 §52)") — 앞 글에서 마지막으로 나온 법령명. 생략 표기의 후보용."""
+    segment = before[-400:]
+    names, _ = _law_index()
+    best = None
+    for name in [*names, *(a for al in [*PRACTICE_ALIASES.values(), *EXTRA_ALIASES.values()] for a in al)]:
+        at = segment.rfind(name)
+        if at < 0 or (at > 0 and re.match(r"[가-힣]", segment[at - 1])):
+            continue
+        if best is None or (at + len(name), len(name)) > (best[0] + len(best[1]), len(best[1])):
+            best = (at, name)
+    if not best:
+        return None
+    res = resolve_law(best[1], partial=False)
+    return {"raw": best[1], "res": res, "old": False} if res["status"] == "ok" else None
+
+
+def _derive(base: dict, kind: str, suffix: str = "") -> dict:
+    """앞 법령(base)에서 '법'·'시행령(영)'·'시행규칙(규칙)'을 이끌어 낸다. 앞 법령이 DB 밖이면 그대로 DB 밖."""
+    if base["res"]["status"] != "ok":
+        return base["res"]
+    root = _law_base(base["res"]["name"])
+    tail = {"영": " 시행령", "시행령": " 시행령", "규칙": " 시행규칙", "시행규칙": " 시행규칙"}.get(kind, f" {suffix}" if suffix else "")
+    return resolve_law(root + tail, partial=False)
+
+
 def extract_article_citations(text: str) -> tuple[list[dict], list[str]]:
+    """조문 인용을 (법령 해석 결과, 조번호, 괄호 제목)으로. 법령명이 생략된 조문은 앞에 나온 법령으로 보고 assumed 표시."""
+    text = _CITE_MARKER_RE.sub(" ", text)  # [law-소득세법_094] 같은 근거 표식 안의 조번호는 인용문이 아니다
     cites, unresolved = [], []
-    prev_end, prev = 0, None  # prev: {"raw","res","old"}
+    prev_end = 0
+    prev = None  # 같은 문단에서 바로 앞 인용의 법령(확정 승계용)
+    ctx = None   # 문서에서 마지막으로 쓴 법령(생략 표기를 넘겨짚을 때)
     for m in ARTICLE_TOKEN_RE.finditer(text):
         window = text[max(prev_end, m.start() - 160): m.start()]
         if re.search(r"\n\s*\n", window):
@@ -1310,34 +1372,48 @@ def extract_article_citations(text: str) -> tuple[list[dict], list[str]]:
         bare = window
         while _TRAILING_PAREN_RE.search(bare):
             bare = _TRAILING_PAREN_RE.sub("", bare)
-        bare = bare.rstrip()
+        bare = bare.rstrip().rstrip("*_`~ ")  # 마크다운 굵게(같은 법 **제69조**)
         same = _SAME_LAW_RE.search(bare)
-        cur = None
+        cur, assumed = None, False
+        # 생략 표기가 가리킬 법령: 마지막 인용의 법령, 인용이 아직 없으면 앞 글에서 언급만 된 법령
+        context = ctx or _last_law_mention(text[: m.start()])
         if same:
-            if prev and prev["res"]["status"] == "ok":
-                kind, suffix = same.group(1), (same.group(2) or "").strip()
-                base = _law_base(prev["res"]["name"])
-                name = base + (" 시행령" if kind == "영" else " 시행규칙" if kind == "규칙" else (f" {suffix}" if suffix else ""))
-                cur = {"raw": same.group(0).strip(), "res": resolve_law(name, partial=False), "old": prev["old"]}
+            base = prev or context
+            if base:
+                assumed = prev is None or bool(prev.get("assumed"))
+                cur = {"raw": same.group(0).strip(), "res": _derive(base, same.group(1), (same.group(2) or "").strip()), "old": base["old"]}
         else:
             raw, res, old = _tail_law(bare)
+            word = _CONTEXT_WORD_RE.search(bare) if res is None else None
+            last_word = bare.split()[-1] if bare.split() else ""
             if res is not None:
                 cur = {"raw": raw, "res": res, "old": old}
+            elif word and context:
+                kind = "법" if word.group(2) == "법률" else word.group(2)
+                cur = {"raw": word.group(0).strip(), "res": _derive(context, kind), "old": word.group(1) in ("구", "종전", "당시") or False}
+                assumed = True
+            elif word:
+                pass  # 가리킬 앞 법령이 없다 → 특정 못 함
             elif prev and _CONNECTOR_RE.fullmatch(bare.strip()):
-                cur = prev
-        no = f"제{m.group(1)}조" + (f"의{m.group(2)}" if m.group(2) else "")
+                cur, assumed = prev, bool(prev.get("assumed"))
+            elif context and not _OTHER_DOCUMENT_RE.search(last_word):
+                cur, assumed = {"raw": "", "res": context["res"], "old": False}, True
+        number = m.group("n") or m.group("s") or m.group("b")
+        no = f"제{number}조" + (f"의{m.group('br')}" if m.group("br") else "")
+        if m.group("b") and (cur is None or assumed or cur["res"]["status"] not in ("ok", "former")):
+            continue  # '제' 없는 'N조'는 법령명·열거에 바로 이어질 때만 조문으로 본다
         prev_end = m.end()
         if cur is None:
-            snippet = clip(text[max(0, m.start() - 12): m.end()], 40)
-            unresolved.append(snippet)
+            unresolved.append(clip(text[max(0, m.start() - 12): m.end()], 40))
             prev = None
             continue
-        prev = cur
-        title = (m.group(3) or "").strip()
+        cur = {**cur, "assumed": assumed}
+        prev = ctx = cur
+        title = (m.group("t") or "").strip()
         if re.search(r"\d|이하|개정|의 것|단서|본문|^각", title):
             title = ""  # 날짜·약칭 정의·'개정되기 전의 것' 같은 괄호는 조문 제목이 아니다
         cites.append({"raw": cur["raw"], "res": cur["res"], "old": cur["old"], "no": no, "title": title,
-                      "evidence": window})
+                      "evidence": window, "assumed": assumed})
     return cites, unresolved
 
 
@@ -1349,7 +1425,10 @@ def title_matches(cited: str, actual: str) -> bool:
     if a == b or (len(a) >= 3 and a in b) or (len(b) >= 3 and b in a):
         return True
     ga, gb = _bigrams(a), _bigrams(b)
-    return bool(ga and gb) and 2 * len(ga & gb) / (len(ga) + len(gb)) >= 0.6
+    if not ga or not gb:
+        return False
+    # 실무에서는 제목을 줄여 쓴다 — 짧은 쪽 글자 조각의 2/3 이상이 긴 쪽에 있으면 같은 제목으로 본다
+    return 2 * len(ga & gb) / (len(ga) + len(gb)) >= 0.6 or len(ga & gb) / min(len(ga), len(gb)) >= 0.65
 
 
 RENUMBER_REASONS = {
@@ -1435,8 +1514,42 @@ def _apply_renumbering(item: dict, c: dict, law: str, evidence: str) -> dict | N
 
 
 def check_article_citation(c: dict) -> dict:
+    """인용 한 건 대조. 법령명이 생략된 인용(assumed)은 확인으로 치지 않고 앞 법령 기준 후보만 준다.
+    실제 답변 400건 실측에서 넘겨짚기는 71%만 맞았다(법령명을 쓴 인용은 99%) — found로 답하면 틀린 조문을 통과시킨다.
+    같은 문장 안에서 이어 쓴 조문만 골라도 12건 중 9건이라 확정으로 올리지 않았다."""
+    if not c.get("assumed"):
+        return _check_article(c)
     res, no = c["res"], c["no"]
-    label = f"{c['raw']} {no}" + (f"({c['title']})" if c["title"] else "")
+    label = f"{c['raw']} {no}".strip() + (f"({c['title']})" if c["title"] else "")
+    item = {"citation": label, "status": "unchecked", "reason": "law_name_omitted"}
+    if res["status"] != "ok":
+        item["note"] = "법령명이 생략됐고, 앞에 나온 법령도 이 DB(세법) 밖이라 대조하지 못했다."
+        return item
+    law = res["name"]
+    root = _law_base(law)
+    # '시행령 제N조'는 그 시행령만, 법령 낱말조차 없는 '제N조'는 앞 법령 묶음(법·시행령·시행규칙) 전부를 후보로
+    tries = [law] if c["raw"] else [law, *[n for n in (root, root + " 시행령", root + " 시행규칙") if n != law]]
+    candidates = []
+    for name in tries:
+        if resolve_law(name, partial=False)["status"] != "ok":
+            continue
+        title = _current_title(name, norm_article_no(no))
+        if title is not None:
+            cand = {"law": name, "number": no, "title": title}
+            if c["title"]:
+                cand["title_check"] = "match" if title_matches(c["title"], title) else "mismatch"
+            candidates.append(cand)
+    if c["title"] and any(x.get("title_check") == "match" for x in candidates):
+        candidates = [x for x in candidates if x["title_check"] == "match"]
+    item.update(assumed_law=law, candidates=candidates)
+    item["note"] = (f"법령명이 생략돼 확인으로 치지 않는다. 앞에 나온 「{root}」 기준 후보를 제목과 함께 준다. 맞는 조문인지 제목으로 확인할 것."
+                    if candidates else f"법령명이 생략됐고, 앞에 나온 「{root}」 쪽에는 이 번호가 없다. 다른 법령의 조문이거나 잘못된 번호일 수 있다.")
+    return item
+
+
+def _check_article(c: dict) -> dict:
+    res, no = c["res"], c["no"]
+    label = f"{c['raw']} {no}".strip() + (f"({c['title']})" if c["title"] else "")
     item = {"citation": label}
     if c["old"]:
         item["old_version"] = True
@@ -1450,8 +1563,12 @@ def check_article_citation(c: dict) -> dict:
                     note=f"옛 법령명 인용. {fmt_date(res['date'])} 이름이 바뀌기 전 번호라 현행 「{res['current']}」 조문과 대조하지 않았다.")
         return item
     if res["status"] != "ok":
-        item.update(status="not_found", reason="law_not_in_db",
-                    note="이 DB(세법)에 없는 법령명이다. 지어낸 이름이거나 세법 밖 법령(민법·형법 등)일 수 있다.")
+        if _TAX_NAME_RE.search(res.get("input") or ""):
+            item.update(status="not_found", reason="law_not_in_db",
+                        note="세법처럼 보이는 이름인데 이 DB에 없다. 지어낸 법령명이거나 잘못 적은 이름일 수 있다.")
+        else:
+            item.update(status="unchecked", reason="non_tax_law",
+                        note="이 DB는 세법만 수록한다. 세법 밖 법령(민법·상법·근로기준법 등)은 law.go.kr에서 확인해야 한다.")
         return item
     law = res["name"]
     if c["old"] and (done := _apply_renumbering(item, c, law, c.get("evidence", ""))) is not None:
@@ -1526,21 +1643,29 @@ def t_verify_citations(args: dict) -> dict:
     seen, arts, over = set(), [], 0
     for c in cites:
         key = (c["res"].get("name") or c["res"].get("input") or c["raw"], c["no"], c["title"], c["old"])
+        if key in seen and not c.get("assumed"):
+            for k, done in enumerate(arts):  # 같은 조문을 법령명과 함께 쓴 곳이 있으면 넘겨짚은 결과를 그것으로 바꾼다
+                if done.get("_key") == key and done.get("reason") == "law_name_omitted":
+                    arts[k] = {**check_article_citation(c), "_key": key}
         if key in seen:
             continue
         seen.add(key)
         if len(arts) >= CITE_LIMIT:
             over += 1
             continue
-        arts.append(check_article_citation(c))
+        arts.append({**check_article_citation(c), "_key": key})
+    for a in arts:
+        a.pop("_key", None)
+    omitted = [a["citation"] for a in arts if a.get("reason") == "law_name_omitted"]
     docs = docs[:40]
     bad = [d["citation"] for d in docs + arts if d["status"] == "not_found"]
     mismatch = [a["citation"] for a in arts if a.get("title_check") == "mismatch"]
-    unchecked = [a["citation"] for a in arts if a["status"] == "unchecked"]
+    unchecked = [a["citation"] for a in arts if a["status"] == "unchecked" and a.get("reason") != "law_name_omitted"]
     found = sum(1 for d in docs + arts if d["status"] == "found")
     summary = (f"문서번호 {len(docs)}건 · 조문 {len(arts)}건 검사: 있음 {found}건, 없음 {len(bad)}건"
                + (f", 제목 불일치 {len(mismatch)}건" if mismatch else "")
                + (f", 대조 못 함 {len(unchecked)}건" if unchecked else "")
+               + (f", 법령명 생략이라 후보만 제시 {len(omitted)}건" if omitted else "")
                + (f", 법령명을 특정하지 못해 검사하지 않은 조문 표기 {len(unresolved)}건" if unresolved else "")
                + (f", 상한 {CITE_LIMIT}건을 넘어 검사하지 않은 조문 {over}건" if over else ""))
     out = {
@@ -1553,6 +1678,8 @@ def t_verify_citations(args: dict) -> dict:
                    "not_found는 지어낸 번호일 수도, 이 DB 미수록일 수도 있다"
                    "(형사·민사 판결, 최근 공개분, 폐지·이동 조문). 조문은 현행 버전 기준이다. "
                    "unchecked·unresolved_articles는 검사하지 못한 것이지 통과한 것이 아니다. "
+                   "법령명 없이 쓴 조문('시행령 제154조', '제155조 제1항')은 확인으로 치지 않는다. "
+                   "앞에 나온 법령 기준 후보(candidates)와 제목만 주므로, 정확히 확인하려면 법령명을 붙여 다시 검증할 것. "
                    "판례 history(주문·원심·상고심·환송 후 판결)는 판결문 머리 표기로 이은 것이라, 없다고 상급심이 없다는 뜻은 아니다. "
                    "옛 번호 인용은 법제처 개정문 대응표로 현행 번호를 찾아 current_number로 준다."),
     }
@@ -1560,6 +1687,8 @@ def t_verify_citations(args: dict) -> dict:
         out["title_mismatch"] = mismatch
     if unchecked:
         out["unchecked"] = unchecked
+    if omitted:
+        out["law_name_omitted"] = omitted
     if unresolved:
         out["unresolved_articles"] = unresolved[:20]
     return out

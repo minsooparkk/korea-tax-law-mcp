@@ -18,7 +18,7 @@ https://mcp.taxdoctorai.com/mcp
 
 ## 도구
 
-현재 버전 **v0.11.0** ([CHANGELOG](CHANGELOG.md))
+현재 버전 **v0.12.0** ([CHANGELOG](CHANGELOG.md))
 
 `search_tax`는 로컬 tax-ai-agent의 `GraphSearcher.search_for_query`와 같은 코드를
 사용합니다. 법률→시행령→시행규칙과 연결 문서를 탐색하고, 각 결과에 실제 노드·관계
