@@ -19,7 +19,7 @@ https://mcp.taxdoctorai.com/mcp
 
 ## 도구
 
-현재 버전 **v0.12.0** ([CHANGELOG](CHANGELOG.md))
+현재 버전 **v0.13.0** ([CHANGELOG](CHANGELOG.md))
 
 `search_tax`는 로컬 tax-ai-agent의 `GraphSearcher.search_for_query`와 같은 코드를
 사용합니다. 법률→시행령→시행규칙과 연결 문서를 탐색하고, 각 결과에 실제 노드·관계
@@ -28,7 +28,7 @@ https://mcp.taxdoctorai.com/mcp
 
 | 도구 | 용도 |
 |---|---|
-| `search_tax` | 로컬과 동일한 통합 탐색, 결과별 실제 경로·원문·적용 시점, `as_of` 별도 조문 버전 조회 |
+| `search_tax` | 로컬과 동일한 통합 탐색, 결과별 실제 경로·원문·적용 시점, `as_of` 별도 조문 버전 조회. `detail: "list"`로 목록만 먼저 받을 수 있음 |
 | `get_evidence` | 검색된 자료의 원문 이어읽기, 원문 전문·요지·미수록 구분 |
 | `list_laws` | 수록 현행 법령 목록 + 시행일 (국세·지방세 구분). 목록 역사 법령 제외 |
 | `search_articles` | 조문 전문검색 (복합어 부분일치 폴백 포함). 현행·검증 CONTAINS만 |
@@ -38,7 +38,7 @@ https://mcp.taxdoctorai.com/mcp
 | `search_interpretations` | 국세청·법제처·행정안전부 해석례 검색. 쟁점 문장·키워드·문서번호 모두 받음 (검증된 인용 아님) |
 | `verify_citations` | 초안의 해석례·판례 문서번호와 조문 인용이 실제로 있는지, 괄호 제목이 현행 제목과 맞는지 확인. 옛 번호는 현행 번호로 옮겨 대조하고, 판례는 주문·원심·상고심·환송 후 판결을 함께 보여 줌 (본문 내용 일치 확인은 아님) |
 | `search_annexes` | 별표·서식 검색 (세율표·기준금액·분류표) |
-| `get_annex` | 별표 본문 전체 + 원본 HWP·PDF 링크 |
+| `get_annex` | 별표 본문(6,000자씩, `offset`으로 이어 읽기) + 원본 HWP·PDF 링크 |
 | `list_upcoming` | 공포됐으나 시행 전인 개정 조문 |
 | `list_treaties` | 조세조약 체결국 목록 / 국가별 협약·의정서 이력 |
 | `search_treaties` | 조세조약 조문 전문검색 (제한세율·고정사업장 등) |
@@ -49,13 +49,25 @@ https://mcp.taxdoctorai.com/mcp
 통합 검색 예시:
 
 ```json
-{"search_intents":{"law":["소득세법 제97조의2"],"ruling":["배우자 증여 이월과세"]},"as_of":"2023-01-01","limit":10}
+{"search_intents":{"law":["소득세법 제97조의2"],"ruling":["배우자 증여 이월과세"]},"as_of":"2023-01-01","limit":3}
 ```
 
 `search_tax`의 `next_offset`으로 다음 결과를 조회합니다. `original_text.continuation`은
 긴 원문을 이어 읽는 `get_evidence` 호출 인자입니다. 검색 집합은 로컬 검색기의 수집
 상한을 따르며 전체 DB 건수는 아닙니다. `as_of_lookup`은 현행 그래프와 별도로 조회한
 당시 조문입니다. 인용 문서의 적용 버전이 미해소이면 현행 적용으로 단정하지 않습니다.
+
+응답 크기(v0.13.0부터): 원문을 싣는 기본 호출은 3건이고, 한 쪽의 원문은 합쳐 약 16,000자까지입니다.
+넘치는 원문은 잘라 `continuation`으로 이어 읽게 합니다. 결과가 수십 건이면 목록부터 받으세요.
+
+```json
+{"search_intents":{"law":["소득세법 제97조의2"]},"detail":"list","limit":100}
+```
+
+목록은 번호·제목·날짜·요지·길이만 한 줄씩 줍니다. 응답의 `groups`가 묶음별 시작 위치(`offset`)와
+건수이므로, 고른 구간을 같은 `result_set_id`로 다시 부르거나 `get_evidence`로 읽으면 됩니다.
+해석례에는 질의요지·회신 요약(`reply_summary`)이, 조약 조문에는 그 조문을 고친 개정 의정서
+안내(`amendments`)가 함께 옵니다.
 
 **Claude** (웹/데스크톱): 설정 → Connectors → Add custom connector → `https://mcp.taxdoctorai.com/mcp`
 

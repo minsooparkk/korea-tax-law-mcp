@@ -48,7 +48,9 @@ from src.search.graph_searcher import (
     source_date_notice,
     source_observation_notice,
 )
-from src.search.public_search import BODY_FIELDS, INTENT_TYPES, NODE_TYPES, PublicGraphSearch
+from src.search.public_search import (
+    BODY_FIELDS, DETAILS, INTENT_TYPES, MAX_LIST_LIMIT, NODE_TYPES, ORIGINAL_LIMIT, PublicGraphSearch,
+)
 from src.search.source_quality import interpretation_body_guard
 
 LOG_DIR = os.environ.get("MCP_LOG_DIR") or os.path.join(REPO, "logs", "mcp")
@@ -56,7 +58,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.12.0"
+SERVER_VERSION = "0.13.0"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -79,6 +81,9 @@ INSTRUCTIONS = (
     "법률→시행령→시행규칙과 인용 문서·참조 조문·통칙·별표를 탐색하고, 결과별 실제 경로·원문·시점을 반환합니다. "
     "search_intents에 law/case/ruling/tribunal/treaty/annex 배열을 지정하세요(tribunal은 조세심판원·국세청 불복 결정례). "
     "next_page가 있으면 그 인자로 다음 결과를 조회하고, original_text.continuation이 있으면 get_evidence로 원문을 이어 읽으세요. "
+    "결과가 많으면 detail='list'로 번호·제목·날짜·요지 목록을 먼저 받아 고르세요. 응답의 groups는 묶음별 시작 위치(offset)입니다. "
+    "원문 포함 응답은 limit 1~3이 한 번에 읽기 좋습니다. 해석례는 reply_summary(질의요지·회신)를 함께 확인하세요. "
+    "조약 조문 결과에 amendments가 붙으면 본문은 개정 전 협약 원문이므로 제한세율 등은 개정문을 먼저 확인하세요. "
     "as_of는 별도 조문 버전 조회이며 현행 그래프의 인용을 과거 적용으로 확정하지 않습니다. "
     "한국 세법 법령 그래프 DB입니다. 국세청 조세법령 목록의 현행 법·령·칙, 판례, "
     "조세심판원 결정례, 국세청 심사·이의·적부 결정례, 국세청·법제처·행정안전부 해석례, 조세조약을 검색·조회할 수 있습니다. "
@@ -1738,17 +1743,29 @@ def t_get_annex(args: dict) -> str:
         out.append(f"근거 조문: {', '.join(r['arts'])}")
     out.append("")
     LIMIT = 6000
-    out.append(body[:LIMIT])
-    if len(body) > LIMIT:
+    try:
+        start = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        start = 0
+    if start >= len(body) > 0:
+        return f"offset {start:,}은 본문 끝({len(body):,}자)을 넘는다. 0부터 다시 읽을 것."
+    if start:
+        out.append(f"(이어 읽기: {start:,}자부터)")
+    out.append(body[start:start + LIMIT])
+    if len(body) > start + LIMIT:
         out.append(
-            f"\n… (전체 {len(body):,}자 중 {LIMIT:,}자만 표시. 표가 길면 "
-            "필요한 구간을 search_annexes로 좁혀 확인하거나 아래 원문 파일을 볼 것)"
+            f"\n… (전체 {len(body):,}자 중 {start:,}~{start + LIMIT:,}자를 표시. 이어 읽으려면 "
+            f"get_annex(law_name, annex_number, offset={start + LIMIT}). 필요한 구간만 찾으려면 "
+            "search_annexes, 표 모양까지 보려면 아래 원문 파일)"
         )
     if r["hwp"] or r["pdf"]:
         base = "https://www.law.go.kr"
         links = [f"{base}{u}" for u in (r["pdf"], r["hwp"]) if u]
         out.append("\n원문 파일: " + " · ".join(links))
     return "\n".join(out)
+
+
+UPCOMING_ARTICLE_LIMIT = 300
 
 
 def t_list_upcoming(args: dict) -> str:
@@ -1775,15 +1792,29 @@ def t_list_upcoming(args: dict) -> str:
         "WHERE ($law IS NULL OR u.law_name CONTAINS $law) "
         "RETURN ua.law_name AS law, ua.enforcement_date AS d, "
         "ua.article_number AS no, ua.article_title AS title, ua.change_type AS kind "
-        "ORDER BY d, law, no LIMIT 60",
-        {"law": law},
+        "ORDER BY d, law, no LIMIT $limit",
+        {"law": law, "limit": UPCOMING_ARTICLE_LIMIT + 1},
     )
     if detail:
+        total = sum(int(r["n"] or 0) for r in rows)
+        shown = detail[:UPCOMING_ARTICLE_LIMIT]
         out.append("\n달라지는 조문:")
-        for x in detail:
+        group = None
+        for x in shown:  # 시행일·법령마다 한 번만 머리를 적어 줄 수를 줄인다
+            if group != (x["d"], x["law"]):
+                group = (x["d"], x["law"])
+                out.append(f"[{fmt_date(x['d'])} · {x['law']}]")
+            out.append(f"- {x['no']} {x['title'] or ''} [{x['kind']}]".replace("  ", " "))
+        if len(detail) > UPCOMING_ARTICLE_LIMIT:
             out.append(
-                f"- {fmt_date(x['d'])} · {x['law']} {x['no']} {x['title']} [{x['kind']}]"
+                f"\n… 조문 {total}개 중 앞 {len(shown)}개만 표시했다. 나머지는 목록에 없다 — "
+                "law_name 을 '소득세법 시행령'처럼 한 법령으로 좁혀 다시 부르거나, "
+                "확인할 조문을 get_article 로 조회할 것(그 조문의 시행예정 개정이 함께 나온다)."
             )
+        if law:
+            names = sorted({r["law"] for r in rows})
+            if len(names) > 1:
+                out.append(f"\n※ '{law}' 로 찾아 {', '.join(names)} 이(가) 함께 나왔다.")
         out.append("\n※ 개정문 본문은 get_article로 그 조문을 조회하면 함께 나온다.")
     return "\n".join(out)
 
@@ -2075,11 +2106,130 @@ def coerce_search_args(args: dict) -> dict:
         a["search_intents"] = intents
     if "as_of" in a:
         a["as_of"] = _normalize_date(a["as_of"])
+    if isinstance(a.get("detail"), str):
+        a["detail"] = a["detail"].strip().lower() or "full"
     return a
 
 
+SEARCH_DEFAULT_LIMIT = 3      # 원문 포함 기본 건수. 10건이면 응답이 한 번에 읽히지 않았다(10/2 점검, 10/12 실측)
+SEARCH_TEXT_BUDGET = 16000    # 한 쪽에 싣는 원문 글자 수 합계
+SEARCH_TEXT_FLOOR = 1500      # 건수가 많아도 건당 이만큼은 싣는다
+_TEMPORAL_KEEP = ("temporal_resolution", "applicability_status", "resolved_version_id")
+_BODY_KEEP = ("text", "kind", "source_field", "next_offset", "continuation")
+
+
+def _drop_empty_deep(value):
+    if isinstance(value, dict):
+        return {k: _drop_empty_deep(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_empty_deep(v) for v in value]
+    return value
+
+
+def _without_empty(d: dict, keep: tuple = ()) -> dict:
+    """값이 없는 칸을 뺀다. 결과 1건의 source 가 140여 칸 중 10여 칸만 차 있었다."""
+    return {k: v for k, v in d.items() if v is not None or k in keep}
+
+
+def _text_caps(lengths: list[int], budget: int, floor: int) -> list[int]:
+    """짧은 원문은 다 싣고 남는 몫을 긴 원문에 돌린다."""
+    caps, remaining = [0] * len(lengths), budget
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    for done, i in enumerate(order):
+        share = max(floor, remaining // (len(order) - done))
+        caps[i] = min(lengths[i], share)
+        remaining = max(0, remaining - caps[i])
+    return caps
+
+
+def _fit_text_budget(results: list[dict]) -> bool:
+    """한 쪽의 원문 합계를 예산에 맞춘다. 잘린 원문은 continuation 으로 이어 읽는다."""
+    bodies = []
+    for r in results:
+        if isinstance(r.get("original_text"), dict):
+            bodies.append((r["original_text"], r.get("evidence_type"), r.get("evidence_id")))
+        lookup = r.get("as_of_lookup") or {}
+        if isinstance(lookup.get("original_text"), dict) and (lookup.get("version") or {}).get("version_id"):
+            bodies.append((lookup["original_text"], "article_version", lookup["version"]["version_id"]))
+    caps = _text_caps([len(b.get("text") or "") for b, _, _ in bodies], SEARCH_TEXT_BUDGET, SEARCH_TEXT_FLOOR)
+    cut = False
+    for (body, kind, ident), cap in zip(bodies, caps):
+        text = body.get("text") or ""
+        if len(text) <= cap or not kind or not ident:
+            continue
+        start = int(body.get("offset") or 0)
+        previous = (body.get("continuation") or {}).get("arguments") or {}
+        arguments = {"evidence_type": kind, "evidence_id": ident, "offset": start + cap, "limit": ORIGINAL_LIMIT}
+        if previous.get("source_field"):
+            arguments["source_field"] = previous["source_field"]
+        body.update({"text": text[:cap], "truncated": True, "next_offset": start + cap,
+                     "continuation": {"tool": "get_evidence", "arguments": arguments}})
+        cut = True
+    return cut
+
+
+def _treaty_amendments(result: dict, cache: dict) -> None:
+    """조약 조문 본문은 협약 원문이라 개정의정서가 반영돼 있지 않다. get_treaty_article 과 같은 안내를 붙인다."""
+    source = result.get("source") or {}
+    ident, country, number = result.get("evidence_id"), source.get("country"), source.get("article_number")
+    if not ident or not country:
+        return
+    if amends := _amendments_of(ident):
+        result["amendments"] = {
+            "notice": "이 본문은 협약 원문이며 아래 개정이 반영돼 있지 않습니다. 제한세율 등 수치는 개정문을 먼저 확인하세요.",
+            "documents": [_without_empty({
+                "title": a["title"], "effective_date": a["d"] or None,
+                "excerpt": amend_excerpt(a["body"], number or "") or None,
+                "access": {"tool": "get_treaty_article",
+                           "arguments": {"country": country, "article_number": a["title"]}},
+            }) for a in amends],
+        }
+        return
+    if country not in cache:
+        cache[country] = _amendment_warning(_treaty_records(country))
+    if cache[country]:
+        result["amendments"] = {"notice": cache[country], "documents": []}
+
+
+def _shape_evidence(result: dict, cache: dict) -> dict:
+    if isinstance(result.get("source"), dict):
+        result["source"] = _without_empty(result["source"])
+    if isinstance(result.get("temporal"), dict):
+        result["temporal"] = _without_empty(result["temporal"], _TEMPORAL_KEEP)
+    if isinstance(result.get("graph_paths"), list):
+        result["graph_paths"] = _drop_empty_deep(result["graph_paths"])
+    bodies = [result.get("original_text"), (result.get("as_of_lookup") or {}).get("original_text")]
+    for holder, body in ((result, bodies[0]), (result.get("as_of_lookup"), bodies[1])):
+        if isinstance(body, dict):
+            holder["original_text"] = _without_empty(body, _BODY_KEEP)
+    if result.get("evidence_type") == "treaty_article":
+        _treaty_amendments(result, cache)
+    return result
+
+
 def t_search_tax(args: dict) -> dict:
-    return PublicGraphSearch(cypher).search(coerce_search_args(args))
+    a = coerce_search_args(args)
+    if a.get("detail", "full") == "full":
+        a.setdefault("limit", SEARCH_DEFAULT_LIMIT)
+    response = PublicGraphSearch(cypher).search(a)
+    results = response.get("results")
+    if not isinstance(results, list) or not results:
+        return response
+    cache: dict = {}
+    if response.get("detail") == "list":
+        for row in results:
+            if row.get("evidence_type") == "treaty_article" and _amendments_of(row["evidence_id"]):
+                row["amended"] = True  # 개정의정서가 이 조문을 고쳤다 — get_treaty_article 로 확인
+        return response
+    for result in results:
+        _shape_evidence(result, cache)
+    if _fit_text_budget(results):
+        response["text_budget"] = (
+            f"한 쪽의 원문은 합쳐 약 {SEARCH_TEXT_BUDGET:,}자까지 싣습니다. 잘린 원문(truncated)은 "
+            "original_text.continuation 으로 이어 읽으세요. limit 을 1~2로 주면 건당 더 길게 받고, "
+            "여러 건을 훑을 때는 detail='list' 로 목록을 먼저 받으세요."
+        )
+    return response
 
 
 def t_get_evidence(args: dict) -> dict:
@@ -2092,7 +2242,8 @@ def t_get_evidence(args: dict) -> dict:
     if not a.get("evidence_id") or not a.get("evidence_type"):
         raise ValueError("get_evidence에는 search_tax 결과 항목의 evidence_type과 evidence_id를 그대로 넣어야 합니다. "
                          "문서번호·사건번호만 알면 search_interpretations·search_cases·verify_citations로 먼저 찾으세요.")
-    return PublicGraphSearch(cypher).get_evidence(a)
+    response = PublicGraphSearch(cypher).get_evidence(a)
+    return _shape_evidence(response, {}) if response.get("found") else response
 
 
 TOOLS = [
@@ -2201,12 +2352,13 @@ TOOLS = [
     },
     {
         "name": "get_annex",
-        "description": "특정 별표·서식의 본문을 반환한다. 조문이 '별표 N에 따른다'로 위임한 세율·기준금액을 확인할 때 사용.",
+        "description": "특정 별표·서식의 본문을 반환한다. 조문이 '별표 N에 따른다'로 위임한 세율·기준금액을 확인할 때 사용. 한 번에 6,000자씩 주며 긴 표는 offset으로 이어 읽는다.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "law_name": {"type": "string", "description": "법령명 (예: '소득세법 시행령')"},
                 "annex_number": {"type": "string", "description": "'별표 2', '별표 1의3', '서식 1' 또는 숫자만"},
+                "offset": {"type": "integer", "minimum": 0, "description": "선택: 이어 읽을 시작 글자 위치 (앞 응답이 알려 준 값)"},
             },
             "required": ["law_name", "annex_number"],
             "additionalProperties": False,
@@ -2215,11 +2367,11 @@ TOOLS = [
     },
     {
         "name": "list_upcoming",
-        "description": "공포됐으나 아직 시행 전인 개정(시행예정)을 반환한다. 시행일·법령·달라지는 조문 목록. 미래 과세기간이 걸린 질문에서 현행 조문만 보고 답하지 않도록 확인용.",
+        "description": "공포됐으나 아직 시행 전인 개정(시행예정)을 반환한다. 시행일·법령·달라지는 조문 목록. 미래 과세기간이 걸린 질문에서 현행 조문만 보고 답하지 않도록 확인용. 특정 조문이 바뀌는지는 get_article로 그 조문을 조회해도 함께 나온다.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "law_name": {"type": "string", "description": "법령명 필터 (생략 시 전체)"},
+                "law_name": {"type": "string", "description": "법령명 필터 (생략 시 전체). 부분 일치라 '소득세법'은 시행령·시행규칙도 함께 준다"},
             },
             "additionalProperties": False,
         },
@@ -2270,7 +2422,7 @@ TOOLS = [
 TOOLS.extend([
     {
         "name": "search_tax",
-        "description": "로컬 tax-ai-agent와 같은 통합 그래프 탐색. law 시작 조문에서 위임을 최대 2단계 따라 판례·예규·해석례·참조조문·통칙·부칙 적용근거·별표를 모으고 전문검색으로 보충한다. 결과마다 실제 graph_paths, DB 원문, 시행일·적용버전·미확정 상태를 반환한다. 쟁점 자료 수집의 우선 도구. next_offset으로 결과를, get_evidence로 긴 원문을 이어 읽을 것.",
+        "description": "로컬 tax-ai-agent와 같은 통합 그래프 탐색. law 시작 조문에서 위임을 최대 2단계 따라 판례·예규·해석례·참조조문·통칙·부칙 적용근거·별표를 모으고 전문검색으로 보충한다. 결과마다 실제 graph_paths, DB 원문, 시행일·적용버전·미확정 상태를 반환한다. 쟁점 자료 수집의 우선 도구. 결과가 수십 건이면 detail='list'로 번호·제목·날짜·요지 목록을 먼저 받아 고른 뒤, 응답의 groups(묶음별 시작 위치)로 offset을 건너뛰거나 get_evidence로 원문을 읽는다. 해석례는 reply_summary(질의요지·회신)를 함께 볼 것. 조약 조문에 amendments가 붙으면 본문보다 개정문이 우선이다.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2283,7 +2435,10 @@ TOOLS.extend([
                 },
                 "as_of": {"type": "string", "description": "선택: YYYY-MM-DD 또는 YYYYMMDD. 조문별 당시 버전을 별도 반환하며 불명 시 현행으로 대체하지 않음."},
                 "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "default": SEARCH_DEFAULT_LIMIT,
+                          "description": "한 쪽 건수. 원문 포함(full)은 기본 3·최대 25, 목록(list)은 기본 30·최대 100. 한 쪽의 원문은 합쳐 약 16,000자까지 싣고 넘치면 continuation으로 이어 읽는다"},
+                "detail": {"type": "string", "enum": list(DETAILS), "default": "full",
+                           "description": "full = 원문까지. list = 원문 없이 번호·제목·날짜·요지·길이만(고른 뒤 같은 result_set_id로 offset을 지정하거나 get_evidence로 읽는다)"},
                 "result_set_id": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "다음 페이지는 이전 응답의 식별자를 전달하여 검색 집합 변경을 감지"},
             },
             "required": ["search_intents"], "additionalProperties": False,

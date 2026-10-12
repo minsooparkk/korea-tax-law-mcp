@@ -1,10 +1,10 @@
 {
   "schema": "tax-public-mcp-bundle-v1",
-  "source_revision": "a0235e799679f1b7870d70732929a029d6fa4bbb",
+  "source_revision": "d195eb3bed5d542ff689a7f43c440e398bce6810",
   "source_dirty": true,
   "files": {
     "server.py": {
-      "sha256": "3d9aa29f721ca24563ca31b85f9c7010c0e60460292786bb94450ab014905898",
+      "sha256": "be56652cca905ca84ba9ad34e700112daf4221b1b16e714bc6c25241e1d4fb2c",
       "source": "mcp/server.py"
     },
     "src/__init__.py": {
@@ -60,7 +60,7 @@
       "source": "src/search/graph_searcher.py"
     },
     "src/search/public_search.py": {
-      "sha256": "ecefb8ea81d55c65732edbaaa65a010ed3c836ca18ab738750eca8797c12d9d4",
+      "sha256": "30d80521685e4249831b93a534231e2b9239ea11aa104ea28bb304ee5b4b9004",
       "source": "src/search/public_search.py"
     },
     "src/search/source_quality.py": {
@@ -68,5 +68,5 @@
       "source": "src/search/source_quality.py"
     }
   },
-  "payload_sha256": "6b98f9f3036aaa422ad9067272b6246a1fdc71fb04bad23dc39259f2ddf59120"
+  "payload_sha256": "419cc70d6511b63b5d5a3e168299651c1c1fc9b6aa314da80d0e95cb3731ce39"
 }

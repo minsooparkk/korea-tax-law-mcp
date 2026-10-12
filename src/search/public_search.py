@@ -88,6 +88,23 @@ META_FIELDS = (
 ) + MAINTENANCE_FIELDS + RETIREMENT_FIELDS + SOURCE_OBSERVATION_FIELDS + CATALOGUE_MATCH_FIELDS + IMAGE_TRANSCRIPTION_FIELDS
 ORIGINAL_LIMIT = 12000
 MAX_BODY_PAGE = 24000
+DETAILS = ("full", "list")
+LIST_LIMIT, MAX_LIST_LIMIT = 30, 100
+LIST_SNIPPET = 120
+REPLY_SUMMARY_LIMIT = 2000
+# 목록 모드에서 번호·제목·날짜·기관·요지로 쓸 칸. 앞에서부터 처음 채워진 값을 쓴다.
+LIST_COLUMNS = {
+    "case": (("case_number",), ("case_name",), ("ruling_date",), ("court_name",), ("case_holding", "ruling_summary")),
+    "interpretation": (("interp_number",), ("interp_title",), ("reply_date",), ("reply_org",), ("content",)),
+    "ruling": (("source_doc_number", "ruling_number"), ("ruling_title",), ("enforcement_date", "promulgation_date"),
+               ("ruling_org",), ("answer_summary", "query_summary")),
+    "basic_rule": (("rule_number",), ("rule_title",), (), (), ("rule_content",)),
+    "amendment": (("promulgation_number",), (), ("promulgation_date",), (), ("application_text", "transitional_text")),
+    "annex": (("annex_number",), ("annex_title",), ("enforcement_date",), (), ()),
+    "treaty_article": (("article_number",), ("article_title",), (), (), ()),
+    "article": (("article_number",), ("article_title",), ("enforcement_date",), (), ()),
+    "article_version": (("article_number",), ("article_title",), ("valid_from", "enforcement_date"), (), ()),
+}
 NOTICE = (
     "관계 인용은 적용 확정이 아닙니다. 문서 작성·선고일과 법령 적용 시점을 구분하세요. "
     "unresolved 또는 적용버전 미확인은 현행 조문으로 보충하지 않습니다. "
@@ -131,7 +148,8 @@ def _arguments(args, allowed):
 
 
 def validate_search(args):
-    _arguments(args, ("search_intents", "as_of", "offset", "limit", "result_set_id"))
+    _arguments(args, ("search_intents", "as_of", "offset", "limit", "result_set_id", "detail"))
+    listing = search_detail(args) == "list"
     token = args.get("result_set_id")
     if token is not None and (not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{64}", token)):
         raise ValueError("result_set_id는 이전 응답의 검색 집합 식별자여야 합니다.")
@@ -148,9 +166,64 @@ def validate_search(args):
     if not 1 <= sum(map(len, normalized.values())) <= 8:
         raise ValueError("검색 의도는 전체 1~8개까지 지정할 수 있습니다.")
     offset = _integer(args.get("offset", 0), "offset")
-    limit = _integer(args.get("limit", 10), "limit", minimum=1, maximum=25)
+    limit = _integer(args.get("limit", LIST_LIMIT if listing else 10), "limit", minimum=1,
+                     maximum=MAX_LIST_LIMIT if listing else 25)
     as_of = _date(args["as_of"]) if "as_of" in args else None
     return normalized, offset, limit, as_of
+
+
+def search_detail(args):
+    """full = 원문까지(기본), list = 원문 없이 번호·제목·날짜·요지 한 줄씩."""
+    detail = args.get("detail", "full") if isinstance(args, dict) else "full"
+    if detail not in DETAILS:
+        raise ValueError("detail: full(원문 포함) 또는 list(목록만) 중 하나입니다.")
+    return detail
+
+
+def result_groups(entries):
+    """묶음별 시작 위치와 건수. 결과는 이 순서로 이어진다 — offset 을 건너뛸 때 쓴다."""
+    groups = []
+    for index, (bucket, kind, _) in enumerate(entries):
+        if groups and groups[-1]["result_group"] == bucket:
+            groups[-1]["count"] += 1
+        else:
+            groups.append({"result_group": bucket, "evidence_type": kind, "offset": index, "count": 1})
+    return groups
+
+
+def _first(node, fields):
+    return next((node[f] for f in fields if isinstance(node.get(f), str | int) and str(node[f]).strip()), None)
+
+
+def list_row(index, bucket, kind, ident, node):
+    """목록 한 줄. 원문은 싣지 않고 길이만 알린다 — 고른 뒤 get_evidence 로 읽는다."""
+    number, title, when, org, summary = (_first(node, fields) for fields in LIST_COLUMNS[kind])
+    owner = node.get("country") if kind == "treaty_article" else node.get("law_name")
+    if owner and kind in ("article", "article_version", "annex", "treaty_article", "amendment"):
+        number = f"{owner} {'부칙 제' + str(number) + '호' if kind == 'amendment' and number else number or ''}".strip()
+    body = original_text(kind, ident, node, limit=1)
+    paths = node.get("graph_paths") or []
+    row = {"index": index, "result_group": bucket, "evidence_type": kind, "evidence_id": ident,
+           "retrieval_method": "graph" if paths else node.get("graph_path") or "direct_lookup",
+           "number": number, "title": title, "date": when, "org": org,
+           "relations": [r.get("type") for r in (paths[0].get("relationships") or [])] if paths else [],
+           "summary": (" ".join(str(summary).split())[:LIST_SNIPPET] if summary else None),
+           "text_kind": body["kind"] if body["kind"] != "original" else None,  # 원문 전문이 아닐 때만 알린다
+           "total_chars": body["total_chars"]}
+    return {k: v for k, v in row.items() if v not in (None, [], "")}
+
+
+def reply_summary(node, selected_field):
+    """국세청 해석례는 전문(full_text)에 사실관계·질의만 있고 회신은 요약 칸(content)에 있는 경우가 대부분이다."""
+    content = node.get("content")
+    if selected_field == "content" or not isinstance(content, str) or not content.strip():
+        return None
+    selected = node.get(selected_field) if selected_field else None
+    if isinstance(selected, str) and selected.strip() == content.strip():
+        return None
+    return {"source_field": "content", "text": content[:REPLY_SUMMARY_LIMIT], "total_chars": len(content),
+            "truncated": len(content) > REPLY_SUMMARY_LIMIT,
+            "notice": "질의요지·회신 요약 칸입니다. original_text 에 회신이 없으면 여기서 확인하세요."}
 
 
 def original_text(evidence_type, evidence_id, node, *, offset=0, limit=ORIGINAL_LIMIT, source_field=None):
@@ -350,10 +423,14 @@ class PublicGraphSearch:
                                            "evidence_type": kind, "evidence_id": ident, "source_field": "extracted_content"}}}]
         if kind == "interpretation" and (maintenance := maintenance_metadata(node)):
             response["maintenance"] = maintenance
+        if kind == "interpretation" and response["original_text"]["kind"] != "metadata_only" and (
+                summary := reply_summary(node, response["original_text"]["source_field"])):
+            response["reply_summary"] = summary
         return response
 
     def search(self, args):
         intents, offset, limit, as_of = validate_search(args)
+        listing = search_detail(args) == "list"
         console = _SearchConsole()
         searcher = self._searcher_factory(self, console=console)
         found = searcher.search_for_query(intents)
@@ -381,13 +458,18 @@ class PublicGraphSearch:
                                      for _, k, n in selected if k == kind))
             originals[kind] = self._read_nodes(kind, [i for i in ids if i])
         results = []
-        for bucket, kind, searched in selected:
+        for position, (bucket, kind, searched) in enumerate(selected, offset):
             ident = searched.get(NODE_TYPES[kind][1]) or searched.get("resolved_version_id")
             raw = originals[kind].get(ident, {})
             if kind == "interpretation" and (catalogue_metadata_only(raw) or catalogue_metadata_only(searched)):
                 continue
             if kind == "case" and (raw.get("body_identity_status") == "unresolved"
                                    or searched.get("body_identity_status") == "unresolved"):
+                continue
+            if listing:
+                merged = {**raw, **searched}
+                merged.update({f: raw[f] for f in BODY_FIELDS[kind] if raw.get(f)})
+                results.append(list_row(position, bucket, kind, ident, merged))
                 continue
             searched_snapshot = searched.get("_content_snapshot")
             if searched_snapshot and raw.get("source_snapshot") and searched_snapshot != raw["source_snapshot"]:
@@ -420,6 +502,7 @@ class PublicGraphSearch:
                 "total_results_scope": "local_engine_selected_results",
                 "retrieval_limits": "로컬 검색기의 위임 2단계 및 유형별 수집 상한을 동일하게 적용합니다. total_results는 전체 DB 일치 건수가 아닙니다.",
                 "offset": offset, "limit": limit, "next_offset": next_offset, "results": results,
+                "groups": result_groups(entries), "detail": "list" if listing else "full",
                 "result_set_id": result_set_id, "next_page": next_page,
                 "warnings": console.warnings, "partial": bool(console.warnings), "notice": NOTICE}
 

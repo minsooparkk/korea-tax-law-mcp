@@ -45,13 +45,22 @@ class SchemaCompatibilityTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
 
     def test_version_and_initialize_payload(self):
-        self.assertEqual(server.SERVER_VERSION, "0.12.0")
+        self.assertEqual(server.SERVER_VERSION, "0.13.0")
         resp = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             "127.0.0.1",
         )
-        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.12.0")
+        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.13.0")
         self.assertIn("검증", resp["result"]["instructions"])
+
+    def test_search_tax_trims_responses_without_new_required_args(self):
+        # v0.13.0: 목록 모드와 기본 건수. 새 인자는 모두 선택이다.
+        props = {t["name"]: t for t in server.TOOLS}["search_tax"]["inputSchema"]["properties"]
+        self.assertEqual(props["detail"]["enum"], ["full", "list"])
+        self.assertEqual((props["limit"]["default"], props["limit"]["maximum"]), (3, 100))
+        self.assertEqual(server._text_caps([100, 30000, 30000], 16000, 1500), [100, 7950, 7950])
+        kept = server._without_empty({"a": 1, "b": None, "resolved_version_id": None}, ("resolved_version_id",))
+        self.assertEqual(kept, {"a": 1, "resolved_version_id": None})
 
     def test_tools_list_keeps_input_schema_keys(self):
         resp = server.handle_message(
