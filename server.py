@@ -58,7 +58,7 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8788"))  # 8787은 사설망용 tax_db_mcp 계열이 사용 중
 
 SERVER_NAME = "korea-tax-law"
-SERVER_VERSION = "0.13.0"
+SERVER_VERSION = "0.14.2"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -695,7 +695,8 @@ Q_SEARCH_ARTICLES_FT = (
     f"AND {current_contains_guard(edge='owns', law='l')} "
     f"AND {current_article_guard(node='node')} "
     "RETURN l.law_name AS law, l.enforcement_date AS enf, node.article_number AS no, "
-    "node.article_title AS title, substring(node.article_content, 0, 260) AS preview, score "
+    "node.article_title AS title, substring(node.article_content, 0, 260) AS preview, "
+    "coalesce(node.article_content, '') AS body, score "
     "ORDER BY score DESC LIMIT $limit"
 )
 
@@ -706,7 +707,8 @@ Q_SEARCH_ARTICLES_FALLBACK = (
     f"AND {current_article_guard(node='a')} "
     "AND (a.article_title CONTAINS $raw OR a.article_content CONTAINS $raw) "
     "RETURN l.law_name AS law, l.enforcement_date AS enf, a.article_number AS no, "
-    "a.article_title AS title, substring(a.article_content, 0, 260) AS preview, 0 AS score "
+    "a.article_title AS title, substring(a.article_content, 0, 260) AS preview, "
+    "coalesce(a.article_content, '') AS body, 0 AS score "
     "ORDER BY CASE WHEN a.article_title CONTAINS $raw THEN 0 ELSE 1 END "
     "LIMIT $limit"
 )
@@ -755,6 +757,90 @@ def t_list_laws(args: dict) -> str:
     return "\n".join(lines)
 
 
+# 일몰(적용기한) 경과 조문 — 웹 근거 검색(src/agents/formatters.py expired_sunset)과 같은 판정 규칙.
+# MCP 호출의 절반 이상이 AI가 기억한 번호로 get_article 을 부른다. 낡은 번호(조특법 제29조의7)를 부르면
+# 본문 ①항에 "2024년 12월 31일이 속하는 과세연도까지"가 있는데도 "현행"으로만 나가 지금 적용되는
+# 제29조의8(통합고용세액공제)로 넘어가지 못했다. 기한 경과를 표시하고, 확인된 후속 조문이 있으면 붙인다.
+_SUNSET_LAWS = ("조세특례제한법", "지방세특례제한법")
+_SUNSET_RE = re.compile(r"(\d{4})년\s*12월\s*31일(?:이\s*속하는\s*과세연도)?\s*까지")
+_ANY_YEAR_END_RE = re.compile(r"(\d{4})년\s*12월\s*31일")
+_SUNSET_SCAN_CHARS = 600  # ①항 머리 — 적용기한은 거기 적힌다
+# 후속 조문은 확인된 짝만 둔다. 웹처럼 "다음 가지번호 + 제목 글자 겹침"으로 고르면 일몰 150건 중 34건에
+# 후보가 붙는데 제29조의7 → 제29조의8 말고는 거의 옆 조문이었다(제89조 → 제89조의2 자료 제출 등, 2026-10-18 전수).
+# 짝은 웹 근거 검색(src/agents/formatters.py SUNSET_SUCCESSORS)과 같다. 2023년 통합고용세액공제(제29조의8) 신설 때
+# 고용증대(제29조의7)·사회보험료(제30조의4)는 2023·2024년 선택 적용 뒤 끝났고(국세청 서면-2024-법인-0625),
+# 경력단절 여성(제29조의3)·청년 고용(제29조의5)도 제29조의8 본문이 이어받았다.
+SUNSET_SUCCESSORS = {
+    ("조세특례제한법", "제29조의3"): ["제29조의8"],
+    ("조세특례제한법", "제29조의5"): ["제29조의8"],
+    ("조세특례제한법", "제29조의7"): ["제29조의8"],
+    ("조세특례제한법", "제30조의4"): ["제29조의8"],
+}
+
+Q_CURRENT_ARTICLES_IN = (
+    "MATCH (l:Law)-[owns:CONTAINS]->(a:Article) "
+    f"WHERE l.law_name = $law AND {current_law_guard(law='l')} AND a.article_number IN $nos "
+    f"AND {current_article_guard(node='a')} "
+    f"AND {current_contains_guard(edge='owns', law='l')} "
+    "RETURN a.article_number AS no, a.article_title AS title, coalesce(a.article_content, '') AS body"
+)
+
+
+def sunset_expired(law: str, content: str | None, today: str | None = None, no: str = "") -> str | None:
+    """조특법·지특법 조문 ①항 머리에 적힌 적용기한이 지났으면 'YYYY-12-31', 아니면 None.
+
+    머리에 여러 기한이 있으면 가장 늦은 것을 적용기한으로 본다(조문 안 옛 특례 구간에 속지 않게).
+    본문 어디든 올해 이후 기한이 있으면 기한이 연장된 조문으로 보고 판정하지 않는다
+    (제87조 주택청약종합저축은 ①항 머리가 2012년이고 뒤 항이 2028년까지다).
+    """
+    if law not in _SUNSET_LAWS or (no and not no.startswith("제")):
+        return None
+    years = [int(m.group(1)) for m in _SUNSET_RE.finditer((content or "")[:_SUNSET_SCAN_CHARS])]
+    if not years:
+        return None
+    last = max(years)
+    year = int((today or datetime.now().strftime("%Y%m%d"))[:4])
+    if year <= last:
+        return None
+    if any(int(m.group(1)) >= year for m in _ANY_YEAR_END_RE.finditer(content or "")):
+        return None
+    return f"{last}-12-31"
+
+
+def sunset_successors(law: str, no: str, today: str | None = None) -> list[dict]:
+    """확인된 후속 조문 중 지금 현행이고 기한이 남은 것."""
+    nos = SUNSET_SUCCESSORS.get((law, no))
+    if not nos:
+        return []
+    rows = cypher(Q_CURRENT_ARTICLES_IN, {"law": law, "nos": nos})
+    order = {n: i for i, n in enumerate(nos)}
+    rows.sort(key=lambda r: order.get(r["no"], 99))
+    return [r for r in rows if not sunset_expired(law, r.get("body"), today, r["no"])]
+
+
+def sunset_notice(law: str, no: str, content: str | None) -> list[str]:
+    """get_article 본문 앞에 넣을 적용기한 경과 안내 줄. 기한이 남았으면 빈 목록.
+
+    기한이 지났다고 조문이 죽은 것은 아니다. 기한 안에 한 취득·가입·고용 증가에 대한 남은 공제·감면과
+    사후관리에는 지금도 쓰인다(청년도약계좌 2025년 가입분 비과세, 1997년 취득 미분양주택 양도).
+    그래서 "쓰지 말라"가 아니라 기한 뒤 새로 생긴 행위에는 안 된다는 사실만 적는다.
+    """
+    sunset = sunset_expired(law, content, no=no)
+    if not sunset:
+        return []
+    lines = [f"⚠ 적용기한 경과: ①항의 적용기한은 {sunset}(이 속하는 과세연도)까지다. 기한 내 행위"
+             "(취득·가입·투자·고용 증가 등)에 따른 잔여 공제·감면·사후관리에는 지금도 적용될 수 있지만, "
+             "기한 후 새로운 행위·과세연도에는 적용되지 않는다."]
+    successors = sunset_successors(law, no)
+    if successors:
+        names = ", ".join(f"{law} {s['no']} {s.get('title') or ''}".strip() for s in successors)
+        lines.append(f"  → 기한 후 사안은 후속 조문: {names} (get_article로 확인)")
+    else:
+        lines.append("  → 후속 조문은 정해 두지 않았다. 기한 후 사안은 search_articles로 "
+                     "같은 주제의 현행 조문이 있는지 확인한다(없으면 제도가 종료됐을 수 있다).")
+    return lines
+
+
 def t_search_articles(args: dict) -> str:
     q = lucene_escape(str(args["query"]))
     law = law_filter(args.get("law_name"))
@@ -785,10 +871,12 @@ def t_search_articles(args: dict) -> str:
     if fallback_term and fallback_term != str(args["query"]).strip().replace(" ", ""):
         out.append(f"※ '{fallback_term}' 부분일치 결과임 (원본 검색어 정확일치 없음):")
     for r in rows:
+        mark = f" [①항 적용기한 {sunset} 경과]" if (sunset := sunset_expired(r["law"], r.get("body"), no=r["no"])) else ""
         out.append(
-            f"[{r['law']} {r['no']}] {r['title'] or ''} (시행 {fmt_date(r['enf'])})\n  {clip(r['preview'], 260)}"
+            f"[{r['law']} {r['no']}] {r['title'] or ''} (시행 {fmt_date(r['enf'])}){mark}\n  {clip(r['preview'], 260)}"
         )
-    out.append("\n※ 원문 전체는 get_article로 조회. 삭제·비현행·비검증 CONTAINS는 제외.")
+    out.append("\n※ 원문 전체는 get_article로 조회. 삭제·비현행·비검증 CONTAINS는 제외. "
+               "적용기한 경과 조문은 get_article 에서 기한 뒤 사안의 안내를 함께 본다.")
     return "\n\n".join(out)
 
 
@@ -808,6 +896,7 @@ def t_get_article(args: dict) -> str:
         f"# {r['law']} {r['no']} {r['title'] or ''}",
         *([note] if (note := resolved_note(res)) else []),
         f"(현행, 시행 {fmt_date(r['enf'])})",
+        *sunset_notice(r["law"], r["no"], r["content"]),
         "",
         r["content"] or "",
     ]
@@ -901,7 +990,57 @@ def t_get_article_history(args: dict) -> str:
     return "\n".join(out)
 
 
+Q_CASE_PREVIEWS = (
+    "MATCH (c:Case) WHERE c.case_id IN $ids AND coalesce(c.body_identity_status, '') <> 'unresolved' "
+    "RETURN c.case_id AS case_id, c.court_type AS court, "
+    "substring(coalesce(c.case_holding, c.ruling_summary, c.full_content, ''), 0, 320) AS preview"
+)
+
+
+def pinned_cases(query: str) -> tuple[list[str], set[str]]:
+    """검색어에 적힌 사건번호를 번호로 바로 찾아 맨 앞에 둘 줄과, 아래 본문 검색에서 뺄 case_id.
+
+    본문 전문검색은 사건번호를 모른다 — '2015두41937'을 넣으면 그 번호가 본문에 적힌
+    다른 증여 사건이 나왔다. 웹 근거 검색(src/search/case_lookup.py)처럼 번호로 먼저 고정한다.
+    """
+    lines, ids = [], set()
+    histories = 0
+    for m in dict.fromkeys(x.group(0).strip() for x in CASE_NO_RE.finditer(query)):
+        hits = lookup_case_numbers(m)
+        if not hits:
+            lines.append(f"[사건번호 {m}] 이 DB에서 찾지 못함. 번호 표기를 확인하거나 아래 본문 검색 결과를 볼 것.")
+            continue
+        previews = {r["case_id"]: r for r in cypher(Q_CASE_PREVIEWS, {"ids": [h["id"] for h in hits[:3]]})}
+        for h in hits[:3]:
+            ids.add(h["id"])
+            p = previews.get(h["id"]) or {}
+            lines.append(f"[사건번호 일치 · {h.get('org') or p.get('court') or '판례'}] {h['no']} {h.get('title') or ''} "
+                         f"({fmt_date(h.get('d'))})\n  {clip(_plain(p.get('preview')), 320) or '(요지 없음 · get_evidence 로 원문 확인)'}")
+            if str(h.get("org") or "").endswith("법원") and histories < CASE_HISTORY_LIMIT:
+                histories += 1
+                if history := case_history(h["id"]):
+                    lines.extend(history_lines(history))
+    return lines, ids
+
+
+def history_lines(history: dict) -> list[str]:
+    """case_history 결과를 search_cases 글 꼴로. 파기환송은 최종 결과가 아니라서 환송 후 판결까지 적는다."""
+    out = []
+    if history.get("order"):
+        out.append(f"  주문: {history['order']}")
+    if history.get("lower_court"):
+        out.append(f"  원심: {history['lower_court']}")
+    for e in history.get("supreme_court") or []:
+        out.append(f"  상고심: {e['number']} ({e['date']}) {e.get('order') or ''}".rstrip())
+    for e in history.get("after_remand") or []:
+        out.append(f"  환송 후: {e['number']} ({e['date']}) {e.get('order') or ''}".rstrip())
+    if history.get("note"):
+        out.append(f"  ※ {history['note']}")
+    return out
+
+
 def t_search_cases(args: dict) -> str:
+    pinned, pinned_ids = pinned_cases(str(args["query"]))
     q = lucene_escape(str(args["query"]))
     limit = min(int(args.get("limit", 5)), 15)
     rows = cypher(
@@ -919,9 +1058,12 @@ def t_search_cases(args: dict) -> str:
         "score ORDER BY score DESC LIMIT $limit",
         {"q": q, "limit": limit},
     )
-    if not rows:
+    rows = [r for r in rows if r.get("case_id") not in pinned_ids]
+    if not rows and not pinned:
         return "검색 결과 없음. 단일 핵심 키워드로 다시 시도해 보세요."
-    out = []
+    out = list(pinned)
+    if pinned and rows:
+        out.append("## 본문 키워드 검색 결과 (사건번호 일치가 아님)")
     for r in rows:
         out.append(
             f"[{r['court'] or '판례'}] {r['no']} {r['name'] or ''} ({fmt_date(r['d'])})\n  {clip(r['preview'], 320)}"
@@ -2298,7 +2440,7 @@ TOOLS = [
     },
     {
         "name": "search_cases",
-        "description": "판례·불복 결정례를 전문검색한다 (대법원·고등법원 등 법원 판례, 조세심판원 심판례, 국세청 심사청구·이의신청·과세전적부심사 결정례). 단일 핵심 키워드가 정확함. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
+        "description": "판례·불복 결정례를 전문검색한다 (대법원·고등법원 등 법원 판례, 조세심판원 심판례, 국세청 심사청구·이의신청·과세전적부심사 결정례). 단일 핵심 키워드가 정확함. 사건번호(2015두41937·조심2020서8493)를 넣으면 그 사건을 번호로 찾아 맨 앞에 두고 법원 판결은 주문·원심·환송 후 판결을 붙인다. 키워드 히트는 현행 조문에 대한 검증된 인용이 아니다.",
         "inputSchema": {
             "type": "object",
             "properties": {

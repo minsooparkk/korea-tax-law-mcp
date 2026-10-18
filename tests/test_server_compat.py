@@ -45,12 +45,12 @@ class SchemaCompatibilityTests(unittest.TestCase):
             self.assertFalse(tool["inputSchema"].get("additionalProperties", True))
 
     def test_version_and_initialize_payload(self):
-        self.assertEqual(server.SERVER_VERSION, "0.13.0")
+        self.assertEqual(server.SERVER_VERSION, "0.14.2")
         resp = server.handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             "127.0.0.1",
         )
-        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.13.0")
+        self.assertEqual(resp["result"]["serverInfo"]["version"], "0.14.2")
         self.assertIn("검증", resp["result"]["instructions"])
 
     def test_search_tax_trims_responses_without_new_required_args(self):
@@ -263,3 +263,39 @@ class InterpretationRankingTests(unittest.TestCase):
         with mock.patch.object(server, "_interp_rows", side_effect=[body, title]):
             ranked = server.rank_interpretations("출자공동사업자 배당소득의 창업중소기업 세액감면 적용 여부", 2)
         self.assertEqual([r["id"] for r in ranked], ["short", "long"])
+
+
+class SunsetAndCaseNumberTests(unittest.TestCase):
+    def test_sunset_read_from_first_paragraph_and_skips_extended_articles(self):
+        head = "① 내국인의 2024년 12월 31일이 속하는 과세연도까지의 기간 중 상시근로자 수가 증가한 경우"
+        self.assertEqual(server.sunset_expired("조세특례제한법", head, "20261018"), "2024-12-31")
+        self.assertIsNone(server.sunset_expired("조세특례제한법", head, "20241231"))
+        self.assertIsNone(server.sunset_expired("소득세법", head, "20261018"))
+        extended = "① 2012년 12월 31일까지 가입한 저축 … ③ 2028년 12월 31일까지 납입한 금액"
+        self.assertIsNone(server.sunset_expired("조세특례제한법", extended, "20261018"))
+
+    def test_expired_article_without_known_successor_does_not_guess(self):
+        with mock.patch.object(server, "cypher", side_effect=AssertionError("짝이 없으면 조회하지 않는다")):
+            lines = server.sunset_notice("조세특례제한법", "제89조", "① 2014년 12월 31일까지 가입하는 경우")
+        self.assertIn("지금도 적용될 수 있지만", lines[0])
+        self.assertIn("search_articles", lines[1])
+
+    def test_search_cases_pins_case_number_first(self):
+        def db(statement, parameters=None):
+            if "c.case_number CONTAINS t" in statement:
+                return [{"id": "s1", "no": "2015두41937", "title": "증여세부과처분취소", "d": "20150910", "org": "대법원"}]
+            if "c.case_id IN $ids" in statement:
+                return [{"case_id": "s1", "court": "대법원", "preview": "부부 사이 예금 이체<br/>증여 추정 여부"}]
+            if "case_original_content_ft_v2" in statement:
+                return [{"no": "2015두41937", "name": "x", "court": "대법원", "d": "20150910", "case_id": "s1", "preview": ""},
+                        {"no": "조심 2017중3379", "name": "사전증여", "court": "조세심판원", "d": "20171218", "case_id": "t1", "preview": "요지"}]
+            return []
+
+        with mock.patch.object(server, "cypher", side_effect=db), \
+             mock.patch.object(server, "case_history", return_value={"after_remand": [
+                 {"number": "서울고등법원-2015-누-57286", "date": "2016.05.18", "order": "부과처분을 취소한다."}]}):
+            text = server.t_search_cases({"query": "2015두41937"})
+        first, rest = text.split("## 본문 키워드 검색 결과", 1)
+        self.assertTrue(first.startswith("[사건번호 일치 · 대법원] 2015두41937"))
+        self.assertIn("환송 후: 서울고등법원-2015-누-57286", first)
+        self.assertNotIn("2015두41937", rest)
